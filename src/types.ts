@@ -81,6 +81,7 @@ export interface HealthInfo {
   origin: string;
   serverIp: string;
   panelHost: string;
+  serverless?: boolean;
 }
 
 export interface StarterTemplate {

@@ -16,7 +16,11 @@ import type {
   SiteRecord,
   StarterTemplate,
 } from '../types';
-import { safeFetchJson, uploadAndInspectChunked } from '../utils/api';
+import {
+  safeFetchJson,
+  uploadAndInspectChunked,
+  type InlineUploadPayload,
+} from '../utils/api';
 import {
   buildCustomDomainUrl,
   formatBytes,
@@ -41,6 +45,8 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
   const [sourceMode, setSourceMode] = useState<'upload' | 'github'>('upload');
   const [upload, setUpload] = useState<CollectedUpload | null>(null);
   const [uploadSessionId, setUploadSessionId] = useState<string | null>(null);
+  const [inlinePayload, setInlinePayload] =
+    useState<InlineUploadPayload | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
 
   const [repoUrl, setRepoUrl] = useState('');
@@ -64,6 +70,7 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
   async function inspectSelectedUpload(item: CollectedUpload) {
     setUpload(item);
     setUploadSessionId(null);
+    setInlinePayload(null);
     setUploadProgress(0);
     setGithubVerifiedUrl(null);
     setDetection(null);
@@ -86,11 +93,17 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
 
     setInspecting(true);
     try {
-      const { uploadId, detection: detected } = await uploadAndInspectChunked(
+      const {
+        uploadId,
+        detection: detected,
+        inlinePayload: inline,
+      } = await uploadAndInspectChunked(
         item,
         (pct) => setUploadProgress(pct),
+        { preferInline: Boolean(health?.serverless) },
       );
       setUploadSessionId(uploadId);
+      setInlinePayload(inline || null);
       setDetection(detected);
     } catch (err) {
       setError(
@@ -193,17 +206,28 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
     setDeploying(true);
     setError(null);
     try {
-      const site = await safeFetchJson<SiteRecord>(
-        `/api/uploads/${encodeURIComponent(uploadSessionId)}/deploy`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            customDomain: normalizedDomain,
-            name: projectName.trim() || normalizedDomain,
-          }),
-        },
-      );
+      const site =
+        inlinePayload && uploadSessionId === '__inline__'
+          ? await safeFetchJson<SiteRecord>('/api/deploy-inline', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                ...inlinePayload,
+                customDomain: normalizedDomain,
+                name: projectName.trim() || normalizedDomain,
+              }),
+            })
+          : await safeFetchJson<SiteRecord>(
+              `/api/uploads/${encodeURIComponent(uploadSessionId)}/deploy`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  customDomain: normalizedDomain,
+                  name: projectName.trim() || normalizedDomain,
+                }),
+              },
+            );
       onDeployed(site);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'تعذر نشر المشروع');
@@ -238,6 +262,7 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
   function resetSelection() {
     setUpload(null);
     setUploadSessionId(null);
+    setInlinePayload(null);
     setUploadProgress(0);
     setDetection(null);
     setGithubVerifiedUrl(null);

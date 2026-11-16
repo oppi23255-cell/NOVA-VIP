@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 60,
+      "includeFiles": "server/**"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index" },
+    { "source": "/sites/(.*)", "destination": "/api/index" },
+    { "source": "/s/(.*)", "destination": "/api/index" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

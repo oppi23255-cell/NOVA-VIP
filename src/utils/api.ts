@@ -44,12 +44,70 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
+export interface InlineUploadPayload {
+  kind: 'zip' | 'folder';
+  dataBase64?: string;
+  files?: Array<{ relPath: string; dataBase64: string }>;
+}
+
 const CHUNK_BYTE_LIMIT = 1024 * 1024; // 1 MB raw -> ~1.33 MB JSON base64
+const INLINE_RAW_LIMIT = Math.floor(2.8 * 1024 * 1024); // ~3.7 MB JSON base64 (fits Vercel 4.5 MB limit)
 
 export async function uploadAndInspectChunked(
   upload: CollectedUpload,
   onProgress?: (percent: number) => void,
-): Promise<{ uploadId: string; detection: ProjectDetection }> {
+  options?: { preferInline?: boolean },
+): Promise<{
+  uploadId: string;
+  detection: ProjectDetection;
+  inlinePayload?: InlineUploadPayload;
+}> {
+  const totalRawBytes =
+    upload.kind === 'zip' && upload.zipFile
+      ? upload.zipFile.size
+      : (upload.files || []).reduce((acc, f) => acc + f.file.size, 0);
+
+  if (options?.preferInline && totalRawBytes > 0 && totalRawBytes <= INLINE_RAW_LIMIT) {
+    onProgress?.(25);
+    let inlinePayload: InlineUploadPayload;
+
+    if (upload.kind === 'zip' && upload.zipFile) {
+      const buf = await upload.zipFile.arrayBuffer();
+      inlinePayload = {
+        kind: 'zip',
+        dataBase64: arrayBufferToBase64(buf),
+      };
+    } else if (upload.files && upload.files.length > 0) {
+      const encoded: Array<{ relPath: string; dataBase64: string }> = [];
+      for (const item of upload.files) {
+        const buf = await item.file.arrayBuffer();
+        encoded.push({
+          relPath: item.relPath,
+          dataBase64: arrayBufferToBase64(buf),
+        });
+      }
+      inlinePayload = { kind: 'folder', files: encoded };
+    } else {
+      throw new Error('لم يتم اختيار أي ملفات صالحة للرفع');
+    }
+
+    onProgress?.(60);
+    const inspected = await safeFetchJson<{ detection: ProjectDetection }>(
+      '/api/inspect-inline',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(inlinePayload),
+      },
+    );
+    onProgress?.(100);
+    return {
+      uploadId: '__inline__',
+      detection: inspected.detection,
+      inlinePayload,
+    };
+  }
+
   const { uploadId } = await safeFetchJson<{ uploadId: string }>(
     '/api/uploads/start',
     {

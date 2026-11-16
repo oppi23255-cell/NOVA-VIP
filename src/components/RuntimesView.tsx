@@ -53,6 +53,17 @@ export function RuntimesView({ health }: RuntimesViewProps) {
         </p>
       </div>
 
+      {health?.serverless && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-xs text-amber-900 leading-relaxed">
+          تعمل اللوحة حالياً في وضع{' '}
+          <span className="font-semibold">Serverless (مثل Vercel)</span>: التخزين
+          الداخلي في <span className="font-mono" dir="ltr">/tmp</span> مؤقت ولا
+          يستمر عبر إعادة تشغيل الحاوية، ولا تتوفر بيئات تشغيل الخلفية الدائمة
+          أو توجيه DNS المباشر على عنوان IP ثابت إلا عند تشغيل المنصة على سيرفرك
+          الشخصي (VPS) عبر <span className="font-mono" dir="ltr">npm start</span>.
+        </div>
+      )}
+
       <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-200">
         {runtimes.map((rt) => (
           <div

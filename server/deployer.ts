@@ -12,7 +12,10 @@ import {
 } from './detector.ts';
 import type { SiteFileEntry, SiteRecord } from './types.ts';
 
-const DATA_ROOT = path.resolve(process.cwd(), 'hosted_data');
+const DATA_ROOT =
+  process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME
+    ? path.join('/tmp', 'modif_hosted_data')
+    : path.resolve(process.cwd(), 'hosted_data');
 const SITES_DIR = path.join(DATA_ROOT, 'sites');
 const TMP_UPLOADS_DIR = path.join(DATA_ROOT, 'tmp_uploads');
 const REGISTRY_FILE = path.join(DATA_ROOT, 'sites.json');
