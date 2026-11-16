@@ -14,6 +14,7 @@ import type { SiteFileEntry, SiteRecord } from './types.ts';
 
 const DATA_ROOT = path.resolve(process.cwd(), 'hosted_data');
 const SITES_DIR = path.join(DATA_ROOT, 'sites');
+const TMP_UPLOADS_DIR = path.join(DATA_ROOT, 'tmp_uploads');
 const REGISTRY_FILE = path.join(DATA_ROOT, 'sites.json');
 
 const MIME_TYPES: Record<string, string> = {
@@ -44,6 +45,7 @@ const runningProcesses = new Map<string, ChildProcess>();
 
 function ensureStorage(): void {
   fs.mkdirSync(SITES_DIR, { recursive: true });
+  fs.mkdirSync(TMP_UPLOADS_DIR, { recursive: true });
   if (!fs.existsSync(REGISTRY_FILE)) {
     fs.writeFileSync(REGISTRY_FILE, '[]', 'utf-8');
   }
@@ -86,11 +88,16 @@ export function getSiteById(id: string): SiteRecord | undefined {
 export function getSiteByDomain(domainOrHost: string): SiteRecord | undefined {
   const host = normalizeDomain(domainOrHost);
   if (!host) return undefined;
-  return loadSites().find(
-    (s) =>
-      s.customDomain.toLowerCase() === host ||
-      s.aliases.some((a) => a.toLowerCase() === host),
-  );
+  const bare = host.replace(/^www\./, '');
+  return loadSites().find((s) => {
+    const primary = s.customDomain.toLowerCase();
+    const primaryBare = primary.replace(/^www\./, '');
+    return (
+      primary === host ||
+      primaryBare === bare ||
+      s.aliases.some((a) => a.toLowerCase() === host || a.toLowerCase().replace(/^www\./, '') === bare)
+    );
+  });
 }
 
 function updateSiteRecord(
@@ -160,6 +167,14 @@ export function extractZipToSite(zipBuffer: Buffer, siteDir: string): void {
     }
     const safeRel = sanitizeRelPath(entryName);
     if (!safeRel) continue;
+    if (
+      safeRel.startsWith('node_modules/') ||
+      safeRel.includes('/node_modules/') ||
+      safeRel.startsWith('.git/') ||
+      safeRel.includes('/.git/')
+    ) {
+      continue;
+    }
     const targetPath = path.join(siteDir, safeRel);
     if (!targetPath.startsWith(siteDir)) continue;
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
@@ -303,6 +318,162 @@ export function createOrReplaceSiteFromUpload(params: {
     updatedAt: now,
     lastDeployedAt: now,
     sourceRepoUrl: params.sourceRepoUrl || existing?.sourceRepoUrl,
+    logs: [
+      `[${new Date().toLocaleTimeString('en-GB', { hour12: false })}] تم استلام ${detection.fileCount} ملف (${formatBytes(detection.totalBytes)})`,
+      `[${new Date().toLocaleTimeString('en-GB', { hour12: false })}] اكتشاف تلقائي: ${detection.language} — ${detection.framework}`,
+    ],
+  };
+
+  if (existing) {
+    const idx = allSites.findIndex((s) => s.id === id);
+    allSites[idx] = record;
+  } else {
+    allSites.unshift(record);
+  }
+  saveSites(allSites);
+
+  void buildAndLaunchSite(id);
+
+  return record;
+}
+
+function getSessionDir(uploadId: string): string {
+  const safeId = uploadId.replace(/[^a-z0-9_-]/gi, '');
+  if (!safeId) throw new Error('معرّف جلسة الرفع غير صالح');
+  return path.join(TMP_UPLOADS_DIR, safeId);
+}
+
+export function createUploadSession(kind: 'zip' | 'folder'): { uploadId: string } {
+  ensureStorage();
+  const uploadId = crypto.randomBytes(8).toString('hex');
+  const sessionDir = getSessionDir(uploadId);
+  fs.mkdirSync(path.join(sessionDir, 'extracted'), { recursive: true });
+  fs.writeFileSync(
+    path.join(sessionDir, 'meta.json'),
+    JSON.stringify({ kind, createdAt: Date.now() }),
+    'utf-8',
+  );
+  return { uploadId };
+}
+
+export function appendZipChunkToSession(uploadId: string, chunk: Buffer): void {
+  const sessionDir = getSessionDir(uploadId);
+  if (!fs.existsSync(sessionDir)) {
+    throw new Error('انتهت صلاحية جلسة الرفع، يرجى المحاولة مرة أخرى');
+  }
+  fs.appendFileSync(path.join(sessionDir, 'archive.zip'), chunk);
+}
+
+export function appendFolderBatchToSession(
+  uploadId: string,
+  files: Array<{ relPath: string; buffer: Buffer }>,
+): void {
+  const sessionDir = getSessionDir(uploadId);
+  const extractedDir = path.join(sessionDir, 'extracted');
+  if (!fs.existsSync(extractedDir)) {
+    throw new Error('انتهت صلاحية جلسة الرفع، يرجى المحاولة مرة أخرى');
+  }
+  for (const file of files) {
+    const safeRel = sanitizeRelPath(file.relPath);
+    if (!safeRel) continue;
+    if (
+      safeRel.startsWith('__MACOSX/') ||
+      safeRel.endsWith('.DS_Store') ||
+      safeRel.startsWith('node_modules/') ||
+      safeRel.includes('/node_modules/') ||
+      safeRel.startsWith('.git/')
+    ) {
+      continue;
+    }
+    const target = path.join(extractedDir, safeRel);
+    if (!target.startsWith(extractedDir)) continue;
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, file.buffer);
+  }
+}
+
+export function finalizeAndInspectSession(uploadId: string) {
+  const sessionDir = getSessionDir(uploadId);
+  const metaPath = path.join(sessionDir, 'meta.json');
+  if (!fs.existsSync(metaPath)) {
+    throw new Error('جلسة الرفع غير موجودة');
+  }
+  const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as {
+    kind: 'zip' | 'folder';
+  };
+  const extractedDir = path.join(sessionDir, 'extracted');
+
+  if (meta.kind === 'zip') {
+    const zipPath = path.join(sessionDir, 'archive.zip');
+    if (!fs.existsSync(zipPath)) {
+      throw new Error('لم يتم استلام بيانات الملف المضغوط');
+    }
+    const zipBuf = fs.readFileSync(zipPath);
+    extractZipToSite(zipBuf, extractedDir);
+  } else {
+    unwrapSingleRootFolder(extractedDir);
+  }
+
+  const detection = detectProject(extractedDir);
+  return {
+    detection,
+    capabilities: getRuntimeCapabilities(),
+  };
+}
+
+export function deployFromUploadSession(params: {
+  uploadId: string;
+  name: string;
+  customDomain: string;
+  siteId?: string;
+}): SiteRecord {
+  ensureStorage();
+  const domain = normalizeDomain(params.customDomain);
+  if (!domain) {
+    throw new Error('يرجى إدخال اسم دومين صالح بحروف إنجليزية أو أرقام (مثال: my-app.dev)');
+  }
+
+  const allSites = loadSites();
+  const existingByDomain = allSites.find(
+    (s) =>
+      s.id !== params.siteId &&
+      (s.customDomain === domain || s.aliases.includes(domain)),
+  );
+  if (existingByDomain) {
+    throw new Error(`الدومين "${domain}" مستخدم بالفعل لمشروع آخر`);
+  }
+
+  const sessionDir = getSessionDir(params.uploadId);
+  const extractedDir = path.join(sessionDir, 'extracted');
+  if (!fs.existsSync(extractedDir)) {
+    throw new Error('جلسة الرفع منتهية أو غير مكتملة، يرجى إعادة اختيار الملفات');
+  }
+
+  const id = params.siteId || crypto.randomBytes(5).toString('hex');
+  stopSiteProcess(id);
+
+  const siteDir = getSiteDir(id);
+  fs.rmSync(siteDir, { recursive: true, force: true });
+  fs.cpSync(extractedDir, siteDir, { recursive: true, force: true });
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+
+  const detection = detectProject(siteDir);
+  const now = new Date().toISOString();
+  const existing = allSites.find((s) => s.id === id);
+
+  const record: SiteRecord = {
+    id,
+    name: params.name.trim() || domain,
+    customDomain: domain,
+    aliases: existing?.aliases || [],
+    status: 'building',
+    statusMessage: 'جاري فحص المشروع وتجهيز بيئة التشغيل...',
+    detection,
+    port: null,
+    pid: null,
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+    lastDeployedAt: now,
     logs: [
       `[${new Date().toLocaleTimeString('en-GB', { hour12: false })}] تم استلام ${detection.fileCount} ملف (${formatBytes(detection.totalBytes)})`,
       `[${new Date().toLocaleTimeString('en-GB', { hour12: false })}] اكتشاف تلقائي: ${detection.language} — ${detection.framework}`,

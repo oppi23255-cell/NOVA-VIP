@@ -7,12 +7,17 @@ import dotenv from 'dotenv';
 import express from 'express';
 import multer from 'multer';
 import {
+  appendFolderBatchToSession,
+  appendZipChunkToSession,
   buildAndLaunchSite,
   createOrReplaceSiteFromUpload,
   createSiteZipBuffer,
+  createUploadSession,
   deleteSite,
+  deployFromUploadSession,
   extractZipToSite,
   fetchGitHubRepoZipBuffer,
+  finalizeAndInspectSession,
   getSiteByDomain,
   getSiteById,
   listSiteFiles,
@@ -43,6 +48,9 @@ const upload = multer({
 });
 
 function getControlPanelHost(): string {
+  if (process.env.PANEL_DOMAIN) {
+    return normalizeDomain(process.env.PANEL_DOMAIN);
+  }
   const appUrl = process.env.APP_URL || '';
   try {
     return appUrl ? new URL(appUrl).hostname.toLowerCase() : '';
@@ -56,7 +64,7 @@ function getServerNetworkIp(): string {
   for (const name of Object.keys(interfaces)) {
     const list = interfaces[name] || [];
     for (const iface of list) {
-      if (iface.family === 'IPv4' && !iface.internal) {
+      if (iface.family === 'IPv4' && !iface.internal && !iface.address.startsWith('169.254.')) {
         return iface.address;
       }
     }
@@ -64,35 +72,49 @@ function getServerNetworkIp(): string {
   return '127.0.0.1';
 }
 
+let cachedPublicIp: string | null = null;
+async function getPublicServerIp(): Promise<string> {
+  if (process.env.PUBLIC_IP) return process.env.PUBLIC_IP.trim();
+  if (cachedPublicIp) return cachedPublicIp;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2000);
+    const resp = await fetch('https://api.ipify.org', { signal: controller.signal });
+    clearTimeout(timer);
+    if (resp.ok) {
+      const ip = (await resp.text()).trim();
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+        cachedPublicIp = ip;
+        return ip;
+      }
+    }
+  } catch {
+    // ignore offline fallback
+  }
+  return getServerNetworkIp();
+}
+
 async function startServer(): Promise<void> {
   const app = express();
   app.set('trust proxy', true);
 
-  // 1. Custom Domain Host-Header Routing (runs before control panel routes)
+  // 1. Custom Domain Host-Header Routing (isolates custom domains across ALL paths including /api/*)
   app.use((req, res, next) => {
-    const reqPath = req.path || '/';
-    if (
-      reqPath.startsWith('/api/') ||
-      reqPath.startsWith('/sites/') ||
-      reqPath.startsWith('/s/')
-    ) {
-      return next();
-    }
-
     const rawHost = String(
       req.headers['x-forwarded-host'] || req.headers.host || '',
     );
     const hostname = normalizeDomain(rawHost.split(',')[0] || '');
     const panelHost = getControlPanelHost();
 
-    if (
-      hostname &&
-      hostname !== 'localhost' &&
-      hostname !== '127.0.0.1' &&
-      hostname !== '0.0.0.0' &&
-      hostname !== panelHost &&
-      !hostname.endsWith('.run.app')
-    ) {
+    const isControlPanelHost =
+      !hostname ||
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '0.0.0.0' ||
+      hostname === panelHost ||
+      hostname.endsWith('.run.app');
+
+    if (!isControlPanelHost) {
       const matchedSite = getSiteByDomain(hostname);
       if (matchedSite) {
         return serveSiteHttp(matchedSite, req, res, req.originalUrl || '/', '/');
@@ -164,17 +186,33 @@ async function startServer(): Promise<void> {
   // 3. JSON body parser for API routes
   app.use('/api', express.json({ limit: '10mb' }));
 
-  app.get('/api/health', (req, res) => {
+  app.get('/api/health', async (req, res) => {
     const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0];
     const protocol = forwardedProto || req.protocol || 'http';
     const host = req.get('host') || `localhost:${PORT}`;
+    const publicIp = await getPublicServerIp();
     res.json({
       ok: true,
       capabilities: getRuntimeCapabilities(),
       origin: `${protocol}://${host}`,
-      serverIp: getServerNetworkIp(),
+      serverIp: publicIp,
       panelHost: getControlPanelHost() || host.split(':')[0],
     });
+  });
+
+  // Caddy on-demand TLS validation endpoint for automatic SSL on custom domains
+  app.get('/api/caddy-ask', (req, res) => {
+    const domain = normalizeDomain(String(req.query.domain || ''));
+    if (!domain) {
+      res.status(400).send('missing domain');
+      return;
+    }
+    const site = getSiteByDomain(domain);
+    if (!site) {
+      res.status(404).send('unknown domain');
+      return;
+    }
+    res.status(200).send('ok');
   });
 
   app.get('/api/templates', (_req, res) => {
@@ -253,6 +291,75 @@ async function startServer(): Promise<void> {
       }
     },
   );
+
+  // Chunked Upload Session API (bypasses proxy request-size & multipart limits)
+  app.post('/api/uploads/start', (req, res) => {
+    try {
+      const kind = req.body?.kind === 'zip' ? 'zip' : 'folder';
+      const session = createUploadSession(kind);
+      res.status(201).json(session);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'تعذر بدء جلسة الرفع';
+      res.status(400).json({ error: message });
+    }
+  });
+
+  app.post('/api/uploads/:id/chunk', (req, res) => {
+    try {
+      const uploadId = req.params.id;
+      if (typeof req.body?.dataBase64 === 'string') {
+        const buf = Buffer.from(req.body.dataBase64, 'base64');
+        appendZipChunkToSession(uploadId, buf);
+        res.json({ ok: true, receivedBytes: buf.length });
+        return;
+      }
+      if (Array.isArray(req.body?.files)) {
+        const items = (
+          req.body.files as Array<{ relPath?: string; dataBase64?: string }>
+        )
+          .filter((f) => f && typeof f.relPath === 'string' && typeof f.dataBase64 === 'string')
+          .map((f) => ({
+            relPath: String(f.relPath),
+            buffer: Buffer.from(String(f.dataBase64), 'base64'),
+          }));
+        appendFolderBatchToSession(uploadId, items);
+        res.json({ ok: true, receivedFiles: items.length });
+        return;
+      }
+      res.status(400).json({ error: 'بيانات الدفعة غير صالحة' });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'تعذر حفظ دفعة الملفات';
+      res.status(400).json({ error: message });
+    }
+  });
+
+  app.post('/api/uploads/:id/inspect', (req, res) => {
+    try {
+      const result = finalizeAndInspectSession(req.params.id);
+      res.json(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'تعذر فحص ملفات المشروع';
+      res.status(400).json({ error: message });
+    }
+  });
+
+  app.post('/api/uploads/:id/deploy', (req, res) => {
+    try {
+      const customDomain = String(req.body?.customDomain || '');
+      const name = String(req.body?.name || '');
+      const siteId = req.body?.siteId ? String(req.body.siteId) : undefined;
+      const site = deployFromUploadSession({
+        uploadId: req.params.id,
+        name,
+        customDomain,
+        siteId,
+      });
+      res.status(201).json(site);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'تعذر نشر المشروع';
+      res.status(400).json({ error: message });
+    }
+  });
 
   // Inspect GitHub Repository before deploying
   app.post('/api/inspect-github', async (req, res) => {
@@ -539,6 +646,28 @@ async function startServer(): Promise<void> {
       dnsError,
     });
   });
+
+  // Ensure /api/* errors and unknown API paths always return valid JSON (never HTML)
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'نقطة نهاية API غير موجودة' });
+  });
+
+  app.use(
+    '/api',
+    (
+      err: Error & { status?: number; code?: string },
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      const status = err.status && err.status >= 400 ? err.status : 400;
+      const msg =
+        err.code === 'LIMIT_FILE_SIZE'
+          ? 'حجم الملف يتجاوز الحد المسموح به'
+          : err.message || 'حدث خطأ في الخادم أثناء معالجة الطلب';
+      res.status(status).json({ error: msg });
+    },
+  );
 
   // 4. Referer-aware fallback for root-relative assets loaded from /sites/:domain/
   app.use((req, res, next) => {

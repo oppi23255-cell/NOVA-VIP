@@ -6,7 +6,18 @@ export interface CollectedUpload {
   totalBytes: number;
 }
 
-const SKIP_SEGMENTS = new Set(['node_modules', '.git', '__MACOSX', '.DS_Store']);
+const SKIP_SEGMENTS = new Set([
+  'node_modules',
+  '.git',
+  '__MACOSX',
+  '.DS_Store',
+  '.next',
+  '__pycache__',
+  '.venv',
+  'venv',
+  'target',
+  '.gradle',
+]);
 
 function shouldSkipPath(relPath: string): boolean {
   const parts = relPath.split('/');

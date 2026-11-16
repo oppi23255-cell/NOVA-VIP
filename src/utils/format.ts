@@ -30,11 +30,10 @@ export function normalizeDomainClient(raw: string): string {
     .replace(/\.{2,}/g, '.');
 }
 
-export function buildLiveUrl(origin: string, customDomain: string): string {
-  const browserOrigin =
-    typeof window !== 'undefined' && window.location?.origin
-      ? window.location.origin
-      : origin;
-  const cleanOrigin = browserOrigin.replace(/\/+$/, '');
-  return `${cleanOrigin}/sites/${encodeURIComponent(customDomain)}/`;
+export function buildCustomDomainUrl(customDomain: string): string {
+  return `https://${customDomain}/`;
+}
+
+export function buildInternalPreviewPath(customDomain: string): string {
+  return `/sites/${encodeURIComponent(customDomain)}/`;
 }

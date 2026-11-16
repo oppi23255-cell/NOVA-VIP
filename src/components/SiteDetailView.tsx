@@ -25,8 +25,10 @@ import type {
   SiteFileEntry,
   SiteRecord,
 } from '../types';
+import { safeFetchJson } from '../utils/api';
 import {
-  buildLiveUrl,
+  buildCustomDomainUrl,
+  buildInternalPreviewPath,
   formatArabicDate,
   formatBytes,
 } from '../utils/format';
@@ -76,11 +78,8 @@ export function SiteDetailView({
     null,
   );
 
-  const origin =
-    typeof window !== 'undefined' && window.location?.origin
-      ? window.location.origin
-      : health?.origin || '';
-  const liveUrl = buildLiveUrl(origin, site.customDomain);
+  const liveUrl = buildCustomDomainUrl(site.customDomain);
+  const previewPath = buildInternalPreviewPath(site.customDomain);
 
   useEffect(() => {
     setDomainInput(site.customDomain);
@@ -163,7 +162,7 @@ export function SiteDetailView({
     setSavingDomain(true);
     setDomainFeedback(null);
     try {
-      const res = await fetch(`/api/sites/${site.id}/domain`, {
+      const updated = await safeFetchJson<SiteRecord>(`/api/sites/${site.id}/domain`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -171,11 +170,7 @@ export function SiteDetailView({
           name: nameInput,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'تعذر حفظ الدومين');
-      }
-      onSiteUpdated(data as SiteRecord);
+      onSiteUpdated(updated);
       setDomainFeedback({
         type: 'ok',
         msg: 'تم تحديث الدومين المخصص وربطه فوراً.',
@@ -194,11 +189,9 @@ export function SiteDetailView({
   async function handleRebuild() {
     setBusyAction('rebuild');
     try {
-      await fetch(`/api/sites/${site.id}/rebuild`, { method: 'POST' });
-      const res = await fetch(`/api/sites/${site.id}`);
-      if (res.ok) {
-        onSiteUpdated((await res.json()) as SiteRecord);
-      }
+      await safeFetchJson(`/api/sites/${site.id}/rebuild`, { method: 'POST' });
+      const fresh = await safeFetchJson<SiteRecord>(`/api/sites/${site.id}`);
+      onSiteUpdated(fresh);
     } finally {
       setBusyAction(null);
     }
@@ -207,10 +200,10 @@ export function SiteDetailView({
   async function handleStop() {
     setBusyAction('stop');
     try {
-      const res = await fetch(`/api/sites/${site.id}/stop`, { method: 'POST' });
-      if (res.ok) {
-        onSiteUpdated((await res.json()) as SiteRecord);
-      }
+      const stopped = await safeFetchJson<SiteRecord>(`/api/sites/${site.id}/stop`, {
+        method: 'POST',
+      });
+      onSiteUpdated(stopped);
     } finally {
       setBusyAction(null);
     }
@@ -219,10 +212,8 @@ export function SiteDetailView({
   async function handleDelete() {
     setBusyAction('delete');
     try {
-      const res = await fetch(`/api/sites/${site.id}`, { method: 'DELETE' });
-      if (res.ok) {
-        onSiteDeleted(site.id);
-      }
+      await safeFetchJson(`/api/sites/${site.id}`, { method: 'DELETE' });
+      onSiteDeleted(site.id);
     } finally {
       setBusyAction(null);
     }
@@ -231,14 +222,12 @@ export function SiteDetailView({
   async function handleVerifyDns() {
     setVerifyingDns(true);
     try {
-      const res = await fetch('/api/verify-domain', {
+      const result = await safeFetchJson<DomainVerifyResult>('/api/verify-domain', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ domain: site.customDomain }),
       });
-      if (res.ok) {
-        setVerifyResult((await res.json()) as DomainVerifyResult);
-      }
+      setVerifyResult(result);
     } finally {
       setVerifyingDns(false);
     }
@@ -516,7 +505,7 @@ export function SiteDetailView({
               ) : (
                 <iframe
                   key={iframeKey}
-                  src={liveUrl}
+                  src={previewPath}
                   title={`معاينة ${site.customDomain}`}
                   className={`bg-white border border-slate-200 rounded-lg h-[480px] transition-all ${
                     viewport === 'mobile' ? 'w-[375px]' : 'w-full'
@@ -786,16 +775,15 @@ export function SiteDetailView({
           <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 space-y-5">
             <div>
               <h2 className="text-base font-semibold text-slate-900">
-                سجلات DNS المطلوبة لربط الدومين الخارجي
+                سجلات DNS المطلوبة لتشغيل الدومين الخاص بك
               </h2>
               <p className="text-xs text-slate-600 mt-1 leading-relaxed">
-                يعمل الرابط المباشر فورياً الآن بدون أي إعدادات. وإذا اشتريت
-                الدومين{' '}
+                أضف السجلات التالية في لوحة تحكم الدومين الخاص بك (مثل
+                Cloudflare أو Namecheap أو GoDaddy) ليعمل{' '}
                 <span className="font-mono text-slate-900" dir="ltr">
                   {site.customDomain}
                 </span>{' '}
-                وتريد توجيهه مباشرة نحو خادمك، أضف أحد السجلين التاليين لدى مزود
-                الدومين:
+                مباشرة على مشروعك بدون ظهور دومين الاستضافة:
               </p>
             </div>
 
@@ -817,13 +805,38 @@ export function SiteDetailView({
                     <td className="py-2.5 px-3 tabular-nums">Auto</td>
                   </tr>
                   <tr>
-                    <td className="py-2.5 px-3 font-semibold">CNAME</td>
+                    <td className="py-2.5 px-3 font-semibold">A</td>
                     <td className="py-2.5 px-3">www</td>
-                    <td className="py-2.5 px-3">{health?.panelHost || site.customDomain}</td>
+                    <td className="py-2.5 px-3">{health?.serverIp || 'YOUR_SERVER_IP'}</td>
                     <td className="py-2.5 px-3 tabular-nums">Auto</td>
                   </tr>
                 </tbody>
               </table>
+            </div>
+
+            <div className="border-t border-slate-200 pt-4 space-y-2">
+              <h3 className="text-xs font-semibold text-slate-900">
+                تفعيل HTTPS تلقائياً على خادمك الخاص (Caddy Reverse Proxy)
+              </h3>
+              <p className="text-xs text-slate-500 leading-relaxed">
+                أضف هذا الإعداد على خادمك ليصدر شهادة SSL مجانية تلقائياً لأي
+                دومين تكتبه في لوحة الاستضافة:
+              </p>
+              <pre
+                dir="ltr"
+                className="bg-slate-950 text-slate-100 rounded-lg p-3.5 text-xs font-mono overflow-x-auto leading-relaxed"
+              >{`{
+  on_demand_tls {
+    ask http://127.0.0.1:3000/api/caddy-ask
+  }
+}
+
+https:// {
+  tls {
+    on_demand
+  }
+  reverse_proxy 127.0.0.1:3000
+}`}</pre>
             </div>
           </div>
 

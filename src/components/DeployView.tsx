@@ -16,13 +16,13 @@ import type {
   SiteRecord,
   StarterTemplate,
 } from '../types';
+import { safeFetchJson, uploadAndInspectChunked } from '../utils/api';
 import {
-  buildLiveUrl,
+  buildCustomDomainUrl,
   formatBytes,
   normalizeDomainClient,
 } from '../utils/format';
 import {
-  buildFormDataFromUpload,
   collectFromDropEvent,
   collectFromFileList,
   type CollectedUpload,
@@ -40,6 +40,9 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
 
   const [sourceMode, setSourceMode] = useState<'upload' | 'github'>('upload');
   const [upload, setUpload] = useState<CollectedUpload | null>(null);
+  const [uploadSessionId, setUploadSessionId] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+
   const [repoUrl, setRepoUrl] = useState('');
   const [githubVerifiedUrl, setGithubVerifiedUrl] = useState<string | null>(
     null,
@@ -56,14 +59,12 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
   );
   const [error, setError] = useState<string | null>(null);
 
-  const origin =
-    typeof window !== 'undefined' && window.location?.origin
-      ? window.location.origin
-      : health?.origin || '';
   const normalizedDomain = normalizeDomainClient(customDomain);
 
   async function inspectSelectedUpload(item: CollectedUpload) {
     setUpload(item);
+    setUploadSessionId(null);
+    setUploadProgress(0);
     setGithubVerifiedUrl(null);
     setDetection(null);
     setError(null);
@@ -85,19 +86,15 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
 
     setInspecting(true);
     try {
-      const fd = buildFormDataFromUpload(item);
-      const res = await fetch('/api/inspect', {
-        method: 'POST',
-        body: fd,
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'تعذر فحص ملفات المشروع');
-      }
-      setDetection(data.detection as ProjectDetection);
+      const { uploadId, detection: detected } = await uploadAndInspectChunked(
+        item,
+        (pct) => setUploadProgress(pct),
+      );
+      setUploadSessionId(uploadId);
+      setDetection(detected);
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : 'حدث خطأ أثناء قراءة لغة المشروع',
+        err instanceof Error ? err.message : 'حدث خطأ أثناء رفع أو قراءة المشروع',
       );
     } finally {
       setInspecting(false);
@@ -112,18 +109,19 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
     setInspecting(true);
     setDetection(null);
     setUpload(null);
+    setUploadSessionId(null);
     setError(null);
     try {
-      const res = await fetch('/api/inspect-github', {
+      const data = await safeFetchJson<{
+        repoName?: string;
+        normalizedUrl?: string;
+        detection: ProjectDetection;
+      }>('/api/inspect-github', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repoUrl }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'تعذر قراءة مستودع GitHub');
-      }
-      setDetection(data.detection as ProjectDetection);
+      setDetection(data.detection);
       setGithubVerifiedUrl(String(data.normalizedUrl || repoUrl));
       if (!projectName && data.repoName) {
         setProjectName(String(data.repoName));
@@ -169,7 +167,7 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
       setDeploying(true);
       setError(null);
       try {
-        const res = await fetch('/api/deploy-github', {
+        const site = await safeFetchJson<SiteRecord>('/api/deploy-github', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -178,11 +176,7 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
             name: projectName.trim() || normalizedDomain,
           }),
         });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || 'فشل النشر من GitHub');
-        }
-        onDeployed(data as SiteRecord);
+        onDeployed(site);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'تعذر نشر المستودع');
       } finally {
@@ -191,27 +185,26 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
       return;
     }
 
-    if (!upload) {
-      setError('يرجى رفع فولدر المشروع أو ملف ZIP أو ملف HTML أولاً');
+    if (!uploadSessionId) {
+      setError('يرجى رفع فولدر المشروع أو ملف ZIP أولاً');
       return;
     }
 
     setDeploying(true);
     setError(null);
     try {
-      const fd = buildFormDataFromUpload(upload, {
-        customDomain: normalizedDomain,
-        name: projectName.trim() || normalizedDomain,
-      });
-      const res = await fetch('/api/deploy', {
-        method: 'POST',
-        body: fd,
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'فشل رفع ونشر المشروع');
-      }
-      onDeployed(data as SiteRecord);
+      const site = await safeFetchJson<SiteRecord>(
+        `/api/uploads/${encodeURIComponent(uploadSessionId)}/deploy`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            customDomain: normalizedDomain,
+            name: projectName.trim() || normalizedDomain,
+          }),
+        },
+      );
+      onDeployed(site);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'تعذر نشر المشروع');
     } finally {
@@ -225,7 +218,7 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
     try {
       const uniqueSuffix = Math.floor(100 + Math.random() * 900);
       const domain = `${tpl.defaultDomain.replace(/\.dev$/, '')}-${uniqueSuffix}.dev`;
-      const res = await fetch('/api/deploy-template', {
+      const site = await safeFetchJson<SiteRecord>('/api/deploy-template', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -234,11 +227,7 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
           name: tpl.title,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'تعذر نشر القالب');
-      }
-      onDeployed(data as SiteRecord);
+      onDeployed(site);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'تعذر نشر القالب');
     } finally {
@@ -248,6 +237,8 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
 
   function resetSelection() {
     setUpload(null);
+    setUploadSessionId(null);
+    setUploadProgress(0);
     setDetection(null);
     setGithubVerifiedUrl(null);
     setError(null);
@@ -259,7 +250,7 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
     Boolean(normalizedDomain) &&
     !deploying &&
     !inspecting &&
-    (sourceMode === 'upload' ? Boolean(upload) : Boolean(repoUrl.trim()));
+    (sourceMode === 'upload' ? Boolean(uploadSessionId) : Boolean(repoUrl.trim()));
 
   return (
     <div className="space-y-8">
@@ -287,7 +278,6 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
         onSubmit={handleDeploySubmit}
         className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start"
       >
-        {/* Right column in RTL: Project Source & Auto-Detection */}
         <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 space-y-6">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
@@ -380,7 +370,7 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
                   اسحب الفولدر أو ملف ZIP أو ملف HTML وأفلته هنا
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  يدعم صفحات HTML المربوطة بـ React أو مشاريع Vite أو أي لغة برمجة
+                  يتم الرفع على دفعات آمنة مع استبعاد node_modules تلقائياً
                 </p>
 
                 <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
@@ -444,11 +434,27 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
             </div>
           )}
 
-          {/* Real-time auto-detection results */}
           {inspecting && (
-            <div className="border-t border-slate-200 pt-5 flex items-center gap-3 text-sm text-slate-600">
-              <Loader2 className="w-4 h-4 animate-spin text-teal-700 shrink-0" />
-              <span>جاري قراءة هيكل المشروع واكتشاف اللغة تلقائياً...</span>
+            <div className="border-t border-slate-200 pt-5 space-y-2.5">
+              <div className="flex items-center justify-between text-sm text-slate-600">
+                <span className="inline-flex items-center gap-2">
+                  <Loader2 className="w-4 h-4 animate-spin text-teal-700 shrink-0" />
+                  <span>جاري رفع الملفات واكتشاف اللغة تلقائياً...</span>
+                </span>
+                {uploadProgress > 0 && (
+                  <span className="font-mono text-xs tabular-nums text-teal-800">
+                    {uploadProgress}%
+                  </span>
+                )}
+              </div>
+              {uploadProgress > 0 && (
+                <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-teal-700 transition-all duration-150"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              )}
             </div>
           )}
 
@@ -460,7 +466,7 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
                   <span>
                     {githubVerifiedUrl
                       ? 'تم جلب المستودع وقراءة اللغة تلقائياً'
-                      : 'تمت القراءة التلقائية للمشروع'}
+                      : 'تم رفع الملفات وقراءة اللغة تلقائياً'}
                   </span>
                 </span>
                 <div className="flex items-center gap-3">
@@ -480,7 +486,6 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
                 </div>
               </div>
 
-              {/* GitHub-style Language Breakdown Bar */}
               {detection.languageStats && detection.languageStats.length > 0 && (
                 <div className="space-y-2">
                   <div className="h-2 w-full rounded-full overflow-hidden flex bg-slate-100">
@@ -554,7 +559,6 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
           )}
         </div>
 
-        {/* Left column in RTL: Custom Domain Configuration & Launch */}
         <div className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6 space-y-6">
           <div>
             <h2 className="text-base font-semibold text-slate-900">
@@ -619,21 +623,21 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
               <div className="border-t border-slate-200 pt-4 space-y-2.5">
                 <div>
                   <span className="text-xs text-slate-500 block">
-                    الرابط المباشر الفوري بعد الرفع:
+                    دومين المشروع الخاص بك:
                   </span>
                   <span
                     className="font-mono text-xs text-teal-800 break-all"
                     dir="ltr"
                   >
-                    {buildLiveUrl(origin, normalizedDomain)}
+                    {buildCustomDomainUrl(normalizedDomain)}
                   </span>
                 </div>
                 <div>
                   <span className="text-xs text-slate-500 block">
-                    عنوان الدومين عند ربط DNS:
+                    توجيه DNS المطلوب (سجل A):
                   </span>
                   <span className="font-mono text-xs text-slate-700" dir="ltr">
-                    https://{normalizedDomain}/
+                    @ → {health?.serverIp || 'YOUR_SERVER_IP'}
                   </span>
                 </div>
               </div>
@@ -648,19 +652,18 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
             {deploying ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                <span>جاري الرفع والتشغيل...</span>
+                <span>جاري التشغيل والربط...</span>
               </>
             ) : (
               <>
                 <Play className="w-4 h-4" />
-                <span>رفع وتشغيل المشروع الآن</span>
+                <span>تشغيل المشروع على الدومين الآن</span>
               </>
             )}
           </button>
         </div>
       </form>
 
-      {/* Real deployable starter templates */}
       <div className="border-t border-slate-200 pt-8 space-y-4">
         <div>
           <h2 className="text-base font-semibold text-slate-900">

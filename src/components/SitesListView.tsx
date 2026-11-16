@@ -9,7 +9,7 @@ import {
 import { useMemo, useState } from 'react';
 import type { HealthInfo, SiteRecord } from '../types';
 import {
-  buildLiveUrl,
+  buildCustomDomainUrl,
   formatArabicDate,
   formatBytes,
 } from '../utils/format';
@@ -25,7 +25,6 @@ interface SitesListViewProps {
 
 export function SitesListView({
   sites,
-  health,
   loading,
   onSelectSite,
   onGoDeploy,
@@ -33,8 +32,6 @@ export function SitesListView({
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<'all' | 'live' | 'other'>('all');
   const [copiedId, setCopiedId] = useState<string | null>(null);
-
-  const origin = health?.origin || window.location.origin;
 
   const filteredSites = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -53,7 +50,7 @@ export function SitesListView({
 
   async function handleCopy(e: React.MouseEvent, site: SiteRecord) {
     e.stopPropagation();
-    const url = buildLiveUrl(origin, site.customDomain);
+    const url = buildCustomDomainUrl(site.customDomain);
     await navigator.clipboard.writeText(url);
     setCopiedId(site.id);
     setTimeout(() => setCopiedId(null), 1800);
@@ -67,7 +64,7 @@ export function SitesListView({
             المشاريع المستضافة
           </h1>
           <p className="mt-1 text-sm text-slate-600">
-            إدارة جميع المواقع والتطبيقات المرفوعة، مع الروابط المباشرة والدومينات المخصصة
+            كل مشروع يعمل مباشرة على الدومين المخصص الخاص بك عبر توجيه الـ DNS
           </p>
         </div>
         <button
@@ -80,7 +77,6 @@ export function SitesListView({
         </button>
       </div>
 
-      {/* Summary metrics strip (unboxed hairline grid) */}
       <div className="grid grid-cols-2 lg:grid-cols-4 bg-white border border-slate-200 rounded-xl divide-y lg:divide-y-0 lg:divide-x lg:divide-x-reverse divide-slate-200">
         <div className="p-4">
           <div className="text-xs text-slate-500">إجمالي المشاريع</div>
@@ -95,7 +91,7 @@ export function SitesListView({
           </div>
         </div>
         <div className="p-4">
-          <div className="text-xs text-slate-500">دومينات مربوطة</div>
+          <div className="text-xs text-slate-500">دومينات مخصصة</div>
           <div className="text-2xl font-bold text-slate-900 mt-1 tabular-nums">
             {sites.length}
           </div>
@@ -108,7 +104,6 @@ export function SitesListView({
         </div>
       </div>
 
-      {/* Search and segmented status filter */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
         <div className="relative flex-1 max-w-md">
           <Search className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
@@ -158,7 +153,6 @@ export function SitesListView({
         </div>
       </div>
 
-      {/* Sites Table / List */}
       {loading ? (
         <div className="bg-white border border-slate-200 rounded-xl divide-y divide-slate-200">
           {[1, 2, 3].map((row) => (
@@ -200,7 +194,7 @@ export function SitesListView({
             <table className="w-full text-right border-collapse">
               <thead>
                 <tr className="border-b border-slate-200 bg-slate-50/70 text-xs font-semibold text-slate-500">
-                  <th className="py-3 px-4">المشروع والدومين</th>
+                  <th className="py-3 px-4">المشروع والدومين المخصص</th>
                   <th className="py-3 px-4">اللغة وإطار العمل</th>
                   <th className="py-3 px-4">الحالة</th>
                   <th className="py-3 px-4">آخر نشر</th>
@@ -209,7 +203,7 @@ export function SitesListView({
               </thead>
               <tbody className="divide-y divide-slate-200 text-sm">
                 {filteredSites.map((site) => {
-                  const liveUrl = buildLiveUrl(origin, site.customDomain);
+                  const customUrl = buildCustomDomainUrl(site.customDomain);
                   return (
                     <tr
                       key={site.id}
@@ -224,7 +218,7 @@ export function SitesListView({
                           className="font-mono text-xs text-teal-700 mt-0.5"
                           dir="ltr"
                         >
-                          {site.customDomain}
+                          {customUrl}
                         </div>
                       </td>
                       <td className="py-3.5 px-4">
@@ -250,7 +244,7 @@ export function SitesListView({
                           <button
                             type="button"
                             onClick={(e) => void handleCopy(e, site)}
-                            title="نسخ الرابط المباشر"
+                            title="نسخ رابط الدومين"
                             className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50 whitespace-nowrap shrink-0"
                           >
                             {copiedId === site.id ? (
@@ -261,12 +255,12 @@ export function SitesListView({
                             ) : (
                               <>
                                 <Copy className="w-3.5 h-3.5" />
-                                <span>نسخ الرابط</span>
+                                <span>نسخ الدومين</span>
                               </>
                             )}
                           </button>
                           <a
-                            href={liveUrl}
+                            href={customUrl}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-teal-800 bg-teal-50 border border-teal-200 rounded-md hover:bg-teal-100 whitespace-nowrap shrink-0"
