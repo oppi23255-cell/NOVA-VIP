@@ -12,13 +12,16 @@ import {
 } from './detector.ts';
 import type { SiteFileEntry, SiteRecord } from './types.ts';
 
-const DATA_ROOT =
-  process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME
-    ? path.join('/tmp', 'modif_hosted_data')
-    : path.resolve(process.cwd(), 'hosted_data');
+const IS_SERVERLESS = Boolean(
+  process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME,
+);
+const DATA_ROOT = IS_SERVERLESS
+  ? path.join('/tmp', 'modif_hosted_data')
+  : path.resolve(process.cwd(), 'hosted_data');
 const SITES_DIR = path.join(DATA_ROOT, 'sites');
 const TMP_UPLOADS_DIR = path.join(DATA_ROOT, 'tmp_uploads');
 const REGISTRY_FILE = path.join(DATA_ROOT, 'sites.json');
+const NPM_CACHE_DIR = path.join(DATA_ROOT, '.npm-cache');
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -677,6 +680,124 @@ export function stopSiteProcess(siteId: string): void {
   }));
 }
 
+function getWritableNpmEnv(extraEnv?: Record<string, string>): Record<string, string> {
+  try {
+    fs.mkdirSync(NPM_CACHE_DIR, { recursive: true });
+    fs.mkdirSync(path.join(NPM_CACHE_DIR, '_logs'), { recursive: true });
+  } catch {
+    // ignore
+  }
+  return {
+    ...(IS_SERVERLESS ? { HOME: DATA_ROOT } : {}),
+    npm_config_cache: NPM_CACHE_DIR,
+    npm_config_logs_dir: path.join(NPM_CACHE_DIR, '_logs'),
+    npm_config_update_notifier: 'false',
+    ...extraEnv,
+  };
+}
+
+function getBarePackageName(specifier: string): string {
+  if (specifier.startsWith('@')) {
+    const parts = specifier.split('/');
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : specifier;
+  }
+  return specifier.split('/')[0] || specifier;
+}
+
+function readSitePackageDeps(siteDir: string): Record<string, string> {
+  const pkgPath = path.join(siteDir, 'package.json');
+  if (!fs.existsSync(pkgPath)) return {};
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    return {
+      ...(pkg.dependencies || {}),
+      ...(pkg.devDependencies || {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function cleanSemverHint(raw?: string): string {
+  if (!raw) return '';
+  const cleaned = raw.trim().replace(/^[\^~>=<=\s]+/, '').split(/\s+/)[0] || '';
+  return /^[0-9]+(\.[0-9]+){0,2}/.test(cleaned) ? `@${cleaned}` : '';
+}
+
+function buildImportMapObject(
+  externalSpecs: Set<string>,
+  pkgDeps: Record<string, string>,
+): Record<string, string> {
+  const reactVer = cleanSemverHint(pkgDeps.react) || '@19.0.1';
+  const reactDomVer = cleanSemverHint(pkgDeps['react-dom']) || reactVer;
+  const imports: Record<string, string> = {};
+
+  const ensureReactCore =
+    externalSpecs.has('react') ||
+    externalSpecs.has('react/jsx-runtime') ||
+    externalSpecs.has('react/jsx-dev-runtime') ||
+    externalSpecs.has('react-dom') ||
+    externalSpecs.has('react-dom/client');
+
+  if (ensureReactCore) {
+    imports['react'] = `https://esm.sh/react${reactVer}`;
+    imports['react/jsx-runtime'] = `https://esm.sh/react${reactVer}/jsx-runtime`;
+    imports['react/jsx-dev-runtime'] = `https://esm.sh/react${reactVer}/jsx-dev-runtime`;
+    imports['react-dom'] = `https://esm.sh/react-dom${reactDomVer}?deps=react${reactVer}`;
+    imports['react-dom/client'] = `https://esm.sh/react-dom${reactDomVer}/client?deps=react${reactVer}`;
+  }
+
+  for (const spec of externalSpecs) {
+    if (imports[spec]) continue;
+    const pkgName = getBarePackageName(spec);
+    const subpath = spec.slice(pkgName.length);
+    const ver = cleanSemverHint(pkgDeps[pkgName]);
+    const depsQuery =
+      pkgName === 'react'
+        ? ''
+        : `?deps=react${reactVer},react-dom${reactDomVer}`;
+    imports[spec] = `https://esm.sh/${pkgName}${ver}${subpath}${depsQuery}`;
+  }
+
+  return imports;
+}
+
+function resolveAliasTarget(siteDir: string, rawAlias: string): string | null {
+  const sub = rawAlias.slice(2).replace(/^\/+/, '');
+  const roots = [path.join(siteDir, 'src'), siteDir];
+  const exts = [
+    '',
+    '.tsx',
+    '.ts',
+    '.jsx',
+    '.js',
+    '.mjs',
+    '.css',
+    '.json',
+    '/index.tsx',
+    '/index.ts',
+    '/index.jsx',
+    '/index.js',
+  ];
+  for (const root of roots) {
+    const base = path.join(root, sub);
+    for (const ext of exts) {
+      const candidate = base + ext;
+      if (
+        candidate.startsWith(siteDir) &&
+        fs.existsSync(candidate) &&
+        fs.statSync(candidate).isFile()
+      ) {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
 async function bundleReactWithLocalEsbuild(
   siteId: string,
   siteDir: string,
@@ -685,6 +806,10 @@ async function bundleReactWithLocalEsbuild(
   const distDir = path.join(siteDir, 'dist');
   fs.mkdirSync(distDir, { recursive: true });
   const workspaceNodeModules = path.resolve(process.cwd(), 'node_modules');
+  const siteNodeModules = path.join(siteDir, 'node_modules');
+  const searchRoots = [siteNodeModules, workspaceNodeModules].filter((r) =>
+    fs.existsSync(r),
+  );
   const outBundle = path.join(distDir, 'app.js');
 
   const fullEntryPath = path.join(siteDir, entryFile);
@@ -721,8 +846,44 @@ createRoot(container).render(React.createElement(App));
     buildTarget = '_modif_entry.tsx';
   }
 
-  try {
+  const pkgDeps = readSitePackageDeps(siteDir);
+  const hasLocalReact = searchRoots.some((r) =>
+    fs.existsSync(path.join(r, 'react')),
+  );
+
+  let forceExternalImportMap = !hasLocalReact;
+  if (!forceExternalImportMap) {
+    const missingRuntime = Object.keys(pkgDeps).some((name) => {
+      if (
+        name.startsWith('@types/') ||
+        name === 'typescript' ||
+        name === 'vite' ||
+        name.startsWith('@vitejs/') ||
+        name.startsWith('@tailwindcss/') ||
+        name === 'tailwindcss' ||
+        name === 'autoprefixer' ||
+        name === 'postcss' ||
+        name === 'eslint' ||
+        name.startsWith('eslint-') ||
+        name.startsWith('@eslint/') ||
+        name === 'prettier'
+      ) {
+        return false;
+      }
+      return !searchRoots.some((r) => fs.existsSync(path.join(r, name)));
+    });
+    if (missingRuntime) {
+      forceExternalImportMap = true;
+    }
+  }
+
+  const externalSpecs = new Set<string>();
+  let detectedTailwindCdn: 'v3' | 'v4' | null = null;
+
+  const runEsbuildPass = async (externalizeBare: boolean): Promise<void> => {
+    externalSpecs.clear();
     const esbuild = await import('esbuild');
+
     await esbuild.build({
       entryPoints: [path.join(siteDir, buildTarget)],
       bundle: true,
@@ -730,7 +891,11 @@ createRoot(container).render(React.createElement(App));
       jsx: 'automatic',
       minify: true,
       absWorkingDir: siteDir,
-      nodePaths: [workspaceNodeModules],
+      nodePaths: searchRoots,
+      define: {
+        'process.env.NODE_ENV': '"production"',
+        'import.meta.env': '{}',
+      },
       loader: {
         '.css': 'css',
         '.svg': 'dataurl',
@@ -742,13 +907,117 @@ createRoot(container).render(React.createElement(App));
         '.woff': 'dataurl',
         '.woff2': 'dataurl',
       },
+      plugins: [
+        {
+          name: 'modif-react-resolver',
+          setup(build) {
+            // 1. Resolve @/ path alias commonly used in React/Vite templates
+            build.onResolve({ filter: /^@\// }, (args) => {
+              const resolved = resolveAliasTarget(siteDir, args.path);
+              if (resolved) return { path: resolved };
+              return undefined;
+            });
+
+            // 2. Compile Tailwind directives cleanly via browser runtime when ESBuild runs standalone
+            build.onResolve({ filter: /^tailwindcss/ }, (args) => {
+              detectedTailwindCdn = 'v4';
+              return { path: args.path, namespace: 'modif-empty-css' };
+            });
+            build.onLoad(
+              { filter: /.*/, namespace: 'modif-empty-css' },
+              () => ({ contents: '', loader: 'css' }),
+            );
+            build.onLoad({ filter: /\.css$/ }, (args) => {
+              if (args.path.includes('node_modules')) return undefined;
+              const rawCss = fs.readFileSync(args.path, 'utf-8');
+              let modified = false;
+              let cleaned = rawCss;
+              if (/@import\s+["']tailwindcss[^"']*["']\s*;?/i.test(cleaned)) {
+                detectedTailwindCdn = 'v4';
+                cleaned = cleaned.replace(
+                  /@import\s+["']tailwindcss[^"']*["']\s*;?/gi,
+                  '',
+                );
+                modified = true;
+              }
+              if (/@tailwind\s+(base|components|utilities|variants)\s*;?/i.test(cleaned)) {
+                detectedTailwindCdn = detectedTailwindCdn || 'v3';
+                cleaned = cleaned.replace(
+                  /@tailwind\s+(base|components|utilities|variants)\s*;?/gi,
+                  '',
+                );
+                modified = true;
+              }
+              if (/@(plugin|custom-variant)\b[^\n]*;?/i.test(cleaned)) {
+                cleaned = cleaned.replace(
+                  /@(plugin|custom-variant)\b[^\n]*;?/gi,
+                  '',
+                );
+                modified = true;
+              }
+              if (!modified) return undefined;
+              return { contents: cleaned, loader: 'css' };
+            });
+
+            // 3. Externalize bare npm imports cleanly via esm.sh importmap if needed
+            build.onResolve({ filter: /^[^./]/ }, (args) => {
+              if (
+                args.path.startsWith('@/') ||
+                args.path.startsWith('node:') ||
+                args.path.startsWith('http://') ||
+                args.path.startsWith('https://') ||
+                args.path.startsWith('data:')
+              ) {
+                return undefined;
+              }
+              if (externalizeBare) {
+                externalSpecs.add(args.path);
+                return { path: args.path, external: true };
+              }
+              return undefined;
+            });
+          },
+        },
+      ],
       outfile: outBundle,
     });
+  };
+
+  try {
+    try {
+      await runEsbuildPass(forceExternalImportMap);
+    } catch (firstErr) {
+      if (!forceExternalImportMap) {
+        appendLog(
+          siteId,
+          'تحويل التجميع إلى ImportMap التلقائي لحزم المشروع...',
+        );
+        await runEsbuildPass(true);
+      } else {
+        throw firstErr;
+      }
+    }
   } finally {
     if (tempBootstrapPath && fs.existsSync(tempBootstrapPath)) {
       fs.rmSync(tempBootstrapPath, { force: true });
     }
   }
+
+  if (!detectedTailwindCdn && pkgDeps.tailwindcss) {
+    detectedTailwindCdn = pkgDeps.tailwindcss.includes('4') ? 'v4' : 'v3';
+  }
+
+  const importMapImports =
+    externalSpecs.size > 0 ? buildImportMapObject(externalSpecs, pkgDeps) : null;
+  const importMapTag = importMapImports
+    ? `<script type="importmap">${JSON.stringify({ imports: importMapImports })}</script>`
+    : '';
+  const tailwindTag =
+    detectedTailwindCdn === 'v4'
+      ? '<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>'
+      : detectedTailwindCdn === 'v3'
+        ? '<script src="https://cdn.tailwindcss.com"></script>'
+        : '';
 
   const hasBundledCss = fs.existsSync(path.join(distDir, 'app.css'));
   const candidateHtmlPaths = [
@@ -760,11 +1029,33 @@ createRoot(container).render(React.createElement(App));
   let html = '';
   if (existingHtmlPath) {
     html = fs.readFileSync(existingHtmlPath, 'utf-8');
+    // Remove unbundled /src/*.css links if app.css is generated
+    if (hasBundledCss) {
+      html = html.replace(
+        /<link[^>]+href=["'][^"']*\/src\/[^"']+\.css["'][^>]*>/gi,
+        '',
+      );
+    }
     // Replace any local script tag pointing to JSX/TSX/TS source
     html = html.replace(
       /<script[^>]+src=["'][^"']*\.(tsx|jsx|ts)["'][^>]*><\/script>/gi,
       '<script type="module" src="./app.js"></script>',
     );
+    if (importMapTag) {
+      // Remove any stale importmap before injecting unified one at top of <head>
+      html = html.replace(
+        /<script[^>]+type=["']importmap["'][^>]*>[\s\S]*?<\/script>/gi,
+        '',
+      );
+      html = /<head[^>]*>/i.test(html)
+        ? html.replace(/<head([^>]*)>/i, `<head$1>\n  ${importMapTag}`)
+        : `${importMapTag}\n${html}`;
+    }
+    if (tailwindTag && !html.includes('tailwindcss')) {
+      html = /<\/head>/i.test(html)
+        ? html.replace(/<\/head>/i, `  ${tailwindTag}\n</head>`)
+        : `${tailwindTag}\n${html}`;
+    }
     if (!html.includes('./app.js')) {
       html = html.includes('</body>')
         ? html.replace('</body>', '<script type="module" src="./app.js"></script></body>')
@@ -782,6 +1073,8 @@ createRoot(container).render(React.createElement(App));
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>React App</title>
+  ${importMapTag}
+  ${tailwindTag}
   ${hasBundledCss ? '<link rel="stylesheet" href="./app.css" />' : ''}
 </head>
 <body>
@@ -836,36 +1129,61 @@ export async function buildAndLaunchSite(siteId: string): Promise<void> {
     if (detection.mode === 'node_build_static') {
       let usedSymlinks = false;
       const hasExistingNm = fs.existsSync(path.join(siteDir, 'node_modules'));
+      const missingPkgs = hasExistingNm ? [] : getMissingWorkspacePackages(siteDir);
 
-      if (!hasExistingNm) {
-        const missingPkgs = getMissingWorkspacePackages(siteDir);
-        if (missingPkgs.length === 0) {
-          usedSymlinks = linkWorkspaceNodeModules(siteDir);
-          if (usedSymlinks) {
-            appendLog(siteId, 'تجهيز الحزم من الكاش السريع للخادم...');
-          }
+      if (!hasExistingNm && missingPkgs.length === 0) {
+        usedSymlinks = linkWorkspaceNodeModules(siteDir);
+        if (usedSymlinks) {
+          appendLog(siteId, 'تجهيز الحزم من الكاش السريع للخادم...');
         }
-        if (!usedSymlinks) {
-          appendLog(siteId, 'تثبيت الحزم المطلوبة (npm install)...');
-          const installCode = await runShellCommand(
-            siteId,
-            'npm',
-            [
-              'install',
-              '--include=dev',
-              '--no-audit',
-              '--no-fund',
-              '--prefer-offline',
-              '--legacy-peer-deps',
-              '--loglevel=error',
-            ],
-            siteDir,
-            { NODE_ENV: 'development' },
-          );
-          if (installCode !== 0) {
-            appendLog(siteId, 'تنبيه: تعذر إكمال npm install، سيتم محاولة التجميع المباشر...');
-            usedSymlinks = linkWorkspaceNodeModules(siteDir);
-          }
+      }
+
+      // In serverless environments (like Vercel) where React/Vite aren't bundled in lambda node_modules,
+      // skip npm install + vite CLI and use in-process ESBuild + automatic ImportMap directly.
+      const fallbackEntryForFastBuild = [
+        'src/main.tsx',
+        'src/main.jsx',
+        'src/index.tsx',
+        'src/index.jsx',
+        'src/App.tsx',
+        'src/App.jsx',
+        'main.tsx',
+        'App.tsx',
+      ].find((c) => fs.existsSync(path.join(siteDir, c)));
+
+      if (IS_SERVERLESS && !hasExistingNm && missingPkgs.length > 0 && fallbackEntryForFastBuild) {
+        appendLog(siteId, `تجميع التطبيق مباشرة عبر المحرك السريع (${fallbackEntryForFastBuild})...`);
+        await bundleReactWithLocalEsbuild(siteId, siteDir, fallbackEntryForFastBuild);
+        appendLog(siteId, 'تم البناء داخل dist/ والموقع يعمل الآن.');
+        updateSiteRecord(siteId, (s) => ({
+          ...s,
+          status: 'live',
+          statusMessage: 'تم البناء ويعمل الآن',
+          detection: { ...detection, outputDir: 'dist', entryFile: 'dist/index.html' },
+        }));
+        return;
+      }
+
+      if (!hasExistingNm && !usedSymlinks) {
+        appendLog(siteId, 'تثبيت الحزم المطلوبة (npm install)...');
+        const installCode = await runShellCommand(
+          siteId,
+          'npm',
+          [
+            'install',
+            '--include=dev',
+            '--no-audit',
+            '--no-fund',
+            '--prefer-offline',
+            '--legacy-peer-deps',
+            '--loglevel=error',
+          ],
+          siteDir,
+          getWritableNpmEnv({ NODE_ENV: 'development' }),
+        );
+        if (installCode !== 0) {
+          appendLog(siteId, 'تنبيه: تعذر إكمال npm install، سيتم التجميع المباشر...');
+          usedSymlinks = linkWorkspaceNodeModules(siteDir);
         }
       }
 
@@ -880,8 +1198,8 @@ export async function buildAndLaunchSite(siteId: string): Promise<void> {
 
       let buildCode = 1;
       try {
+        const localViteBin = path.join(siteDir, 'node_modules/.bin/vite');
         if (hasVite && (!pkg.scripts?.build || pkg.scripts.build.includes('vite build'))) {
-          const localViteBin = path.join(siteDir, 'node_modules/.bin/vite');
           if (fs.existsSync(localViteBin)) {
             buildCode = await runShellCommand(
               siteId,
@@ -889,40 +1207,38 @@ export async function buildAndLaunchSite(siteId: string): Promise<void> {
               ['build', '--base=./'],
               siteDir,
             );
-          } else {
+          } else if (fs.existsSync(path.join(siteDir, 'node_modules'))) {
             buildCode = await runShellCommand(
               siteId,
               'npx',
               ['vite', 'build', '--base=./'],
               siteDir,
+              getWritableNpmEnv(),
             );
           }
-        } else {
-          buildCode = await runShellCommand(siteId, 'npm', ['run', 'build'], siteDir);
-          if (buildCode !== 0 && hasVite) {
+        } else if (fs.existsSync(path.join(siteDir, 'node_modules'))) {
+          buildCode = await runShellCommand(
+            siteId,
+            'npm',
+            ['run', 'build'],
+            siteDir,
+            getWritableNpmEnv(),
+          );
+          if (buildCode !== 0 && hasVite && fs.existsSync(localViteBin)) {
             appendLog(siteId, 'إعادة المحاولة عبر vite build مباشرة...');
             buildCode = await runShellCommand(
               siteId,
-              'npx',
-              ['vite', 'build', '--base=./'],
+              localViteBin,
+              ['build', '--base=./'],
               siteDir,
             );
           }
         }
 
         if (buildCode !== 0) {
-          const fallbackEntry = [
-            'src/main.tsx',
-            'src/main.jsx',
-            'src/index.tsx',
-            'src/index.jsx',
-            'src/App.tsx',
-            'src/App.jsx',
-          ].find((c) => fs.existsSync(path.join(siteDir, c)));
-
-          if (fallbackEntry) {
-            appendLog(siteId, `تفعيل التجميع المباشر السريع لملف ${fallbackEntry}...`);
-            await bundleReactWithLocalEsbuild(siteId, siteDir, fallbackEntry);
+          if (fallbackEntryForFastBuild) {
+            appendLog(siteId, `تفعيل التجميع المباشر السريع لملف ${fallbackEntryForFastBuild}...`);
+            await bundleReactWithLocalEsbuild(siteId, siteDir, fallbackEntryForFastBuild);
           } else {
             throw new Error('فشل بناء المشروع (npm run build)');
           }
@@ -975,7 +1291,7 @@ export async function buildAndLaunchSite(siteId: string): Promise<void> {
               '--loglevel=error',
             ],
             siteDir,
-            { NODE_ENV: 'development' },
+            getWritableNpmEnv({ NODE_ENV: 'development' }),
           );
           if (installCode !== 0) {
             throw new Error('فشل تثبيت حزم Node.js');
@@ -984,7 +1300,13 @@ export async function buildAndLaunchSite(siteId: string): Promise<void> {
       }
 
       if (detection.buildCommand) {
-        const bCode = await runShellCommand(siteId, 'npm', ['run', 'build'], siteDir);
+        const bCode = await runShellCommand(
+          siteId,
+          'npm',
+          ['run', 'build'],
+          siteDir,
+          getWritableNpmEnv(),
+        );
         if (bCode !== 0) {
           throw new Error('فشل بناء تطبيق Node.js');
         }
