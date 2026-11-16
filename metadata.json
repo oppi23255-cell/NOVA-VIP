@@ -1,0 +1,8 @@
+{
+  "name": "مضيف - منصة الاستضافة الخاصة",
+  "description": "منصة استضافة ذاتية الملكية تقرأ لغة المشروع تلقائياً عند رفع فولدر أو ملف مضغوط وتنشره على دومين مخصص بروابط مباشرة.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
