@@ -84,7 +84,31 @@ export function SiteDetailView({
   useEffect(() => {
     setDomainInput(site.customDomain);
     setNameInput(site.name);
+    setVerifyResult(null);
   }, [site.id, site.customDomain, site.name]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function checkDns() {
+      try {
+        const res = await fetch('/api/verify-domain', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ domain: site.customDomain }),
+        });
+        if (res.ok && !cancelled) {
+          const data = (await res.json()) as DomainVerifyResult;
+          setVerifyResult(data);
+        }
+      } catch {
+        // ignore passive DNS probe errors
+      }
+    }
+    void checkDns();
+    return () => {
+      cancelled = true;
+    };
+  }, [site.customDomain]);
 
   useEffect(() => {
     if (site.status !== 'building' && site.status !== 'uploading') return;
@@ -304,13 +328,23 @@ export function SiteDetailView({
             </button>
 
             <a
-              href={liveUrl}
+              href={previewPath}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 whitespace-nowrap shrink-0"
             >
               <ExternalLink className="w-3.5 h-3.5" />
-              <span>فتح الموقع</span>
+              <span>فتح المشروع (معاينة كاملة)</span>
+            </a>
+
+            <a
+              href={liveUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
+            >
+              <Globe className="w-3.5 h-3.5" />
+              <span>فتح الدومين</span>
             </a>
 
             <a
@@ -377,7 +411,7 @@ export function SiteDetailView({
 
         <div className="bg-white border border-slate-200 rounded-lg px-4 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
           <div className="flex items-center gap-2 min-w-0">
-            <span className="text-slate-500 shrink-0">الرابط المباشر:</span>
+            <span className="text-slate-500 shrink-0">الدومين المخصص:</span>
             <a
               href={liveUrl}
               target="_blank"
@@ -390,6 +424,33 @@ export function SiteDetailView({
           </div>
           <span className="text-slate-500 shrink-0">{site.statusMessage}</span>
         </div>
+
+        {verifyResult &&
+          verifyResult.dnsA.length === 0 &&
+          verifyResult.dnsCname.length === 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 text-xs text-amber-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="leading-relaxed">
+                <span className="font-semibold">
+                  ملاحظة DNS ({site.customDomain}):
+                </span>{' '}
+                لم يتم العثور على سجل DNS عام لهذا النطاق على الإنترنت بعد (لذلك
+                يظهر{' '}
+                <span className="font-mono" dir="ltr">
+                  DNS_PROBE_FINISHED_NXDOMAIN
+                </span>{' '}
+                عند فتح الرابط العام حتى تسجل الدومين وتربط سجلات الـ DNS). يمكنك
+                تشغيل ومشاهدة المشروع الآن عبر زر{' '}
+                <span className="font-semibold">فتح المشروع (معاينة كاملة)</span>.
+              </div>
+              <button
+                type="button"
+                onClick={() => setTab('dns')}
+                className="px-3 py-1.5 text-xs font-semibold text-amber-950 bg-white border border-amber-300 rounded-md hover:bg-amber-100 whitespace-nowrap shrink-0 self-start sm:self-center"
+              >
+                خطوات ربط الـ DNS
+              </button>
+            </div>
+          )}
       </div>
 
       {/* Sub-navigation Tabs */}
@@ -775,57 +836,109 @@ export function SiteDetailView({
           <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 space-y-5">
             <div>
               <h2 className="text-base font-semibold text-slate-900">
-                سجلات DNS المطلوبة لتشغيل الدومين الخاص بك
+                سجلات DNS المطلوبة لتشغيل الدومين لجميع المستخدمين
               </h2>
               <p className="text-xs text-slate-600 mt-1 leading-relaxed">
-                أضف السجلات التالية في لوحة تحكم الدومين الخاص بك (مثل
-                Cloudflare أو Namecheap أو GoDaddy) ليعمل{' '}
+                لكي يفتح{' '}
                 <span className="font-mono text-slate-900" dir="ltr">
                   {site.customDomain}
                 </span>{' '}
-                مباشرة على مشروعك بدون ظهور دومين الاستضافة:
+                في متصفح أي مستخدم على الإنترنت (دون خطأ{' '}
+                <span className="font-mono" dir="ltr">
+                  NXDOMAIN
+                </span>
+                )، يجب أن يكون النطاق مسجلاً بالفعل لدى مزود نطاقات (مثل
+                Cloudflare أو Namecheap أو GoDaddy)، ثم إضافة السجلات التالية:
               </p>
             </div>
 
-            <div className="overflow-x-auto border border-slate-200 rounded-lg">
-              <table className="w-full text-right text-xs border-collapse" dir="ltr">
-                <thead>
-                  <tr className="bg-slate-50 border-b border-slate-200 text-slate-500">
-                    <th className="py-2.5 px-3 text-left">Type</th>
-                    <th className="py-2.5 px-3 text-left">Name / Host</th>
-                    <th className="py-2.5 px-3 text-left">Value / Target</th>
-                    <th className="py-2.5 px-3 text-left">TTL</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-200 font-mono text-slate-800">
-                  <tr>
-                    <td className="py-2.5 px-3 font-semibold">A</td>
-                    <td className="py-2.5 px-3">@</td>
-                    <td className="py-2.5 px-3">{health?.serverIp || 'YOUR_SERVER_IP'}</td>
-                    <td className="py-2.5 px-3 tabular-nums">Auto</td>
-                  </tr>
-                  <tr>
-                    <td className="py-2.5 px-3 font-semibold">A</td>
-                    <td className="py-2.5 px-3">www</td>
-                    <td className="py-2.5 px-3">{health?.serverIp || 'YOUR_SERVER_IP'}</td>
-                    <td className="py-2.5 px-3 tabular-nums">Auto</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
+            {health?.serverless ? (
+              <div className="space-y-4">
+                <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                  <table className="w-full text-right text-xs border-collapse" dir="ltr">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                        <th className="py-2.5 px-3 text-left">Type</th>
+                        <th className="py-2.5 px-3 text-left">Name / Host</th>
+                        <th className="py-2.5 px-3 text-left">Value / Target</th>
+                        <th className="py-2.5 px-3 text-left">TTL</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200 font-mono text-slate-800">
+                      <tr>
+                        <td className="py-2.5 px-3 font-semibold">A</td>
+                        <td className="py-2.5 px-3">@</td>
+                        <td className="py-2.5 px-3">76.76.21.21</td>
+                        <td className="py-2.5 px-3 tabular-nums">Auto</td>
+                      </tr>
+                      <tr>
+                        <td className="py-2.5 px-3 font-semibold">CNAME</td>
+                        <td className="py-2.5 px-3">www</td>
+                        <td className="py-2.5 px-3">cname.vercel-dns.com</td>
+                        <td className="py-2.5 px-3 tabular-nums">Auto</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded-lg p-3 leading-relaxed">
+                  عند تشغيل هذه المنصة على Vercel: أضف أيضاً{' '}
+                  <span className="font-mono font-semibold" dir="ltr">
+                    {site.customDomain}
+                  </span>{' '}
+                  داخل{' '}
+                  <span className="font-mono" dir="ltr">
+                    Project Settings → Domains
+                  </span>{' '}
+                  في لوحة Vercel، مع ملاحظة أن التخزين على Vercel مؤقت؛ ولتشغيل
+                  دومينات مستضافة بشكل دائم لكل الزوار يُنصح بتثبيت المنصة على
+                  سيرفر خاص (VPS) عبر{' '}
+                  <span className="font-mono" dir="ltr">
+                    npm start
+                  </span>
+                  .
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                  <table className="w-full text-right text-xs border-collapse" dir="ltr">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-slate-500">
+                        <th className="py-2.5 px-3 text-left">Type</th>
+                        <th className="py-2.5 px-3 text-left">Name / Host</th>
+                        <th className="py-2.5 px-3 text-left">Value / Target</th>
+                        <th className="py-2.5 px-3 text-left">TTL</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200 font-mono text-slate-800">
+                      <tr>
+                        <td className="py-2.5 px-3 font-semibold">A</td>
+                        <td className="py-2.5 px-3">@</td>
+                        <td className="py-2.5 px-3">{health?.serverIp || 'YOUR_SERVER_IP'}</td>
+                        <td className="py-2.5 px-3 tabular-nums">Auto</td>
+                      </tr>
+                      <tr>
+                        <td className="py-2.5 px-3 font-semibold">A</td>
+                        <td className="py-2.5 px-3">www</td>
+                        <td className="py-2.5 px-3">{health?.serverIp || 'YOUR_SERVER_IP'}</td>
+                        <td className="py-2.5 px-3 tabular-nums">Auto</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
 
-            <div className="border-t border-slate-200 pt-4 space-y-2">
-              <h3 className="text-xs font-semibold text-slate-900">
-                تفعيل HTTPS تلقائياً على خادمك الخاص (Caddy Reverse Proxy)
-              </h3>
-              <p className="text-xs text-slate-500 leading-relaxed">
-                أضف هذا الإعداد على خادمك ليصدر شهادة SSL مجانية تلقائياً لأي
-                دومين تكتبه في لوحة الاستضافة:
-              </p>
-              <pre
-                dir="ltr"
-                className="bg-slate-950 text-slate-100 rounded-lg p-3.5 text-xs font-mono overflow-x-auto leading-relaxed"
-              >{`{
+                <div className="border-t border-slate-200 pt-4 space-y-2">
+                  <h3 className="text-xs font-semibold text-slate-900">
+                    تفعيل HTTPS تلقائياً على خادمك الخاص (Caddy Reverse Proxy)
+                  </h3>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    أضف هذا الإعداد على خادمك ليصدر شهادة SSL مجانية تلقائياً لأي
+                    دومين تكتبه في لوحة الاستضافة:
+                  </p>
+                  <pre
+                    dir="ltr"
+                    className="bg-slate-950 text-slate-100 rounded-lg p-3.5 text-xs font-mono overflow-x-auto leading-relaxed"
+                  >{`{
   on_demand_tls {
     ask http://127.0.0.1:3000/api/caddy-ask
   }
@@ -837,7 +950,9 @@ https:// {
   }
   reverse_proxy 127.0.0.1:3000
 }`}</pre>
-            </div>
+                </div>
+              </>
+            )}
           </div>
 
           <div className="lg:col-span-5 bg-white border border-slate-200 rounded-xl p-6 space-y-4">

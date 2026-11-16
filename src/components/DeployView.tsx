@@ -662,7 +662,10 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
                     توجيه DNS المطلوب (سجل A):
                   </span>
                   <span className="font-mono text-xs text-slate-700" dir="ltr">
-                    @ → {health?.serverIp || 'YOUR_SERVER_IP'}
+                    @ →{' '}
+                    {health?.serverless
+                      ? '76.76.21.21'
+                      : health?.serverIp || 'YOUR_SERVER_IP'}
                   </span>
                 </div>
               </div>

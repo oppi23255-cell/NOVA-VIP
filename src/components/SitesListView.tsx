@@ -10,6 +10,7 @@ import { useMemo, useState } from 'react';
 import type { HealthInfo, SiteRecord } from '../types';
 import {
   buildCustomDomainUrl,
+  buildInternalPreviewPath,
   formatArabicDate,
   formatBytes,
 } from '../utils/format';
@@ -260,13 +261,13 @@ export function SitesListView({
                             )}
                           </button>
                           <a
-                            href={customUrl}
+                            href={buildInternalPreviewPath(site.customDomain)}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-teal-800 bg-teal-50 border border-teal-200 rounded-md hover:bg-teal-100 whitespace-nowrap shrink-0"
                           >
                             <ExternalLink className="w-3.5 h-3.5" />
-                            <span>فتح</span>
+                            <span>فتح المشروع</span>
                           </a>
                           <button
                             type="button"
