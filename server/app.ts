@@ -8,7 +8,6 @@ import multer from 'multer';
 import {
   appendFolderBatchToSession,
   appendZipChunkToSession,
-  buildAndLaunchSite,
   createOrReplaceSiteFromUpload,
   createSiteZipBuffer,
   createUploadSession,
@@ -26,7 +25,9 @@ import {
   serveRefererAssetIfMatched,
   serveSiteHttp,
   stopSiteProcess,
+  triggerSiteBuild,
   updateSiteDomain,
+  waitForBuildInitial,
   writeUploadedFilesToSite,
 } from './deployer.ts';
 import { detectProject, getRuntimeCapabilities } from './detector.ts';
@@ -348,7 +349,7 @@ export async function createHostingApp(
     }
   });
 
-  app.post('/api/uploads/:id/deploy', (req, res) => {
+  app.post('/api/uploads/:id/deploy', async (req, res) => {
     try {
       const customDomain = String(req.body?.customDomain || '');
       const name = String(req.body?.name || '');
@@ -359,7 +360,8 @@ export async function createHostingApp(
         customDomain,
         siteId,
       });
-      res.status(201).json(site);
+      await waitForBuildInitial(site.id, 3000);
+      res.status(201).json(getSiteById(site.id) || site);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'تعذر نشر المشروع';
       res.status(400).json({ error: message });
@@ -406,7 +408,7 @@ export async function createHostingApp(
     }
   });
 
-  app.post('/api/deploy-inline', (req, res) => {
+  app.post('/api/deploy-inline', async (req, res) => {
     try {
       const customDomain = String(req.body?.customDomain || '');
       const name = String(req.body?.name || '');
@@ -426,7 +428,8 @@ export async function createHostingApp(
           siteId,
           zipBuffer,
         });
-        res.status(201).json(site);
+        await waitForBuildInitial(site.id, 3000);
+        res.status(201).json(getSiteById(site.id) || site);
         return;
       }
 
@@ -449,7 +452,8 @@ export async function createHostingApp(
           siteId,
           files: items,
         });
-        res.status(201).json(site);
+        await waitForBuildInitial(site.id, 3000);
+        res.status(201).json(getSiteById(site.id) || site);
         return;
       }
 
@@ -503,7 +507,8 @@ export async function createHostingApp(
         zipBuffer,
         sourceRepoUrl: normalizedUrl,
       });
-      res.status(201).json(site);
+      await waitForBuildInitial(site.id, 3000);
+      res.status(201).json(getSiteById(site.id) || site);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'فشل النشر من GitHub';
       res.status(400).json({ error: message });
@@ -516,7 +521,7 @@ export async function createHostingApp(
       { name: 'zipFile', maxCount: 1 },
       { name: 'files', maxCount: 2500 },
     ]),
-    (req, res) => {
+    async (req, res) => {
       try {
         const uploaded = req.files as Record<string, Express.Multer.File[]> | undefined;
         const zipFile = uploaded?.zipFile?.[0];
@@ -537,7 +542,8 @@ export async function createHostingApp(
             siteId,
             zipBuffer: zipFile.buffer,
           });
-          res.status(201).json(site);
+          await waitForBuildInitial(site.id, 3000);
+          res.status(201).json(getSiteById(site.id) || site);
           return;
         }
 
@@ -558,7 +564,8 @@ export async function createHostingApp(
             siteId,
             files: items,
           });
-          res.status(201).json(site);
+          await waitForBuildInitial(site.id, 3000);
+          res.status(201).json(getSiteById(site.id) || site);
           return;
         }
 
@@ -570,7 +577,7 @@ export async function createHostingApp(
     },
   );
 
-  app.post('/api/deploy-template', (req, res) => {
+  app.post('/api/deploy-template', async (req, res) => {
     try {
       const templateId = String(req.body.templateId || '');
       const customDomain = String(req.body.customDomain || '');
@@ -589,7 +596,8 @@ export async function createHostingApp(
         customDomain: customDomain || tpl.defaultDomain,
         files,
       });
-      res.status(201).json(site);
+      await waitForBuildInitial(site.id, 3000);
+      res.status(201).json(getSiteById(site.id) || site);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'تعذر نشر القالب';
       res.status(400).json({ error: message });
@@ -610,14 +618,15 @@ export async function createHostingApp(
     }
   });
 
-  app.post('/api/sites/:id/rebuild', (req, res) => {
+  app.post('/api/sites/:id/rebuild', async (req, res) => {
     const site = getSiteById(req.params.id);
     if (!site) {
       res.status(404).json({ error: 'المشروع غير موجود' });
       return;
     }
     stopSiteProcess(site.id);
-    void buildAndLaunchSite(site.id);
+    void triggerSiteBuild(site.id);
+    await waitForBuildInitial(site.id, 3000);
     res.json({ ok: true });
   });
 

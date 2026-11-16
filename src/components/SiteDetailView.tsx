@@ -101,7 +101,7 @@ export function SiteDetailView({
       } catch {
         // ignore
       }
-    }, 1200);
+    }, 600);
     return () => clearInterval(timer);
   }, [site.id, site.status, onSiteUpdated]);
 

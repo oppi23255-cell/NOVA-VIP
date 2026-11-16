@@ -45,6 +45,29 @@ const MIME_TYPES: Record<string, string> = {
 };
 
 const runningProcesses = new Map<string, ChildProcess>();
+const activeBuildPromises = new Map<string, Promise<void>>();
+
+export function triggerSiteBuild(siteId: string): Promise<void> {
+  const promise = buildAndLaunchSite(siteId).finally(() => {
+    if (activeBuildPromises.get(siteId) === promise) {
+      activeBuildPromises.delete(siteId);
+    }
+  });
+  activeBuildPromises.set(siteId, promise);
+  return promise;
+}
+
+export async function waitForBuildInitial(
+  siteId: string,
+  maxWaitMs = 3000,
+): Promise<void> {
+  const active = activeBuildPromises.get(siteId);
+  if (!active) return;
+  await Promise.race([
+    active,
+    new Promise<void>((resolve) => setTimeout(resolve, maxWaitMs)),
+  ]);
+}
 
 function ensureStorage(): void {
   fs.mkdirSync(SITES_DIR, { recursive: true });
@@ -335,7 +358,7 @@ export function createOrReplaceSiteFromUpload(params: {
   }
   saveSites(allSites);
 
-  void buildAndLaunchSite(id);
+  void triggerSiteBuild(id);
 
   return record;
 }
@@ -457,7 +480,11 @@ export function deployFromUploadSession(params: {
 
   const siteDir = getSiteDir(id);
   fs.rmSync(siteDir, { recursive: true, force: true });
-  fs.cpSync(extractedDir, siteDir, { recursive: true, force: true });
+  try {
+    fs.renameSync(extractedDir, siteDir);
+  } catch {
+    fs.cpSync(extractedDir, siteDir, { recursive: true, force: true });
+  }
   fs.rmSync(sessionDir, { recursive: true, force: true });
 
   const detection = detectProject(siteDir);
@@ -491,7 +518,7 @@ export function deployFromUploadSession(params: {
   }
   saveSites(allSites);
 
-  void buildAndLaunchSite(id);
+  void triggerSiteBuild(id);
 
   return record;
 }
@@ -551,15 +578,83 @@ function waitForPort(port: number, timeoutMs = 12000): Promise<boolean> {
       });
       socket.once('error', () => {
         socket.destroy();
-        if (Date.now() - started >= timeoutMs) {
+        const elapsed = Date.now() - started;
+        if (elapsed >= timeoutMs) {
           resolve(false);
         } else {
-          setTimeout(attempt, 250);
+          setTimeout(attempt, elapsed < 2000 ? 60 : 180);
         }
       });
     };
     attempt();
   });
+}
+
+function getMissingWorkspacePackages(siteDir: string): string[] {
+  const pkgPath = path.join(siteDir, 'package.json');
+  if (!fs.existsSync(pkgPath)) return [];
+  const wsNodeModules = path.resolve(process.cwd(), 'node_modules');
+  if (!fs.existsSync(wsNodeModules)) return ['*'];
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    const allDeps = {
+      ...(pkg.dependencies || {}),
+      ...(pkg.devDependencies || {}),
+    };
+    const missing: string[] = [];
+    for (const name of Object.keys(allDeps)) {
+      if (
+        name.startsWith('@types/') ||
+        name === 'typescript' ||
+        name === 'eslint' ||
+        name.startsWith('eslint-') ||
+        name.startsWith('@eslint/') ||
+        name === 'prettier'
+      ) {
+        continue;
+      }
+      if (!fs.existsSync(path.join(wsNodeModules, name))) {
+        missing.push(name);
+      }
+    }
+    return missing;
+  } catch {
+    return ['*'];
+  }
+}
+
+function linkWorkspaceNodeModules(siteDir: string): boolean {
+  const wsNm = path.resolve(process.cwd(), 'node_modules');
+  const siteNm = path.join(siteDir, 'node_modules');
+  if (!fs.existsSync(wsNm) || fs.existsSync(siteNm)) return false;
+  try {
+    fs.mkdirSync(siteNm, { recursive: true });
+    for (const entry of fs.readdirSync(wsNm)) {
+      const src = path.join(wsNm, entry);
+      const dest = path.join(siteNm, entry);
+      try {
+        fs.symlinkSync(src, dest);
+      } catch {
+        // ignore individual entry symlink conflict
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cleanupSymlinkedNodeModules(siteDir: string): void {
+  const siteNm = path.join(siteDir, 'node_modules');
+  if (!fs.existsSync(siteNm)) return;
+  try {
+    fs.rmSync(siteNm, { recursive: true, force: true });
+  } catch {
+    // ignore cleanup error
+  }
 }
 
 export function stopSiteProcess(siteId: string): void {
@@ -589,7 +684,6 @@ async function bundleReactWithLocalEsbuild(
 ): Promise<void> {
   const distDir = path.join(siteDir, 'dist');
   fs.mkdirSync(distDir, { recursive: true });
-  const esbuildBin = path.resolve(process.cwd(), 'node_modules/.bin/esbuild');
   const workspaceNodeModules = path.resolve(process.cwd(), 'node_modules');
   const outBundle = path.join(distDir, 'app.js');
 
@@ -601,7 +695,6 @@ async function bundleReactWithLocalEsbuild(
   let buildTarget = entryFile;
   let tempBootstrapPath: string | null = null;
 
-  // If entry file only exports a component without mounting via createRoot/render, create a tiny bootstrapper
   const mountsToDom =
     entrySource.includes('createRoot') ||
     entrySource.includes('ReactDOM.render') ||
@@ -629,26 +722,28 @@ createRoot(container).render(React.createElement(App));
   }
 
   try {
-    const code = await runShellCommand(
-      siteId,
-      esbuildBin,
-      [
-        buildTarget,
-        '--bundle',
-        '--format=esm',
-        '--jsx=automatic',
-        '--loader:.css=css',
-        '--loader:.svg=dataurl',
-        '--loader:.png=dataurl',
-        `--outfile=${outBundle}`,
-      ],
-      siteDir,
-      { NODE_PATH: workspaceNodeModules },
-    );
-
-    if (code !== 0) {
-      throw new Error('فشل تجميع ملفات React عبر ESBuild');
-    }
+    const esbuild = await import('esbuild');
+    await esbuild.build({
+      entryPoints: [path.join(siteDir, buildTarget)],
+      bundle: true,
+      format: 'esm',
+      jsx: 'automatic',
+      minify: true,
+      absWorkingDir: siteDir,
+      nodePaths: [workspaceNodeModules],
+      loader: {
+        '.css': 'css',
+        '.svg': 'dataurl',
+        '.png': 'dataurl',
+        '.jpg': 'dataurl',
+        '.jpeg': 'dataurl',
+        '.gif': 'dataurl',
+        '.webp': 'dataurl',
+        '.woff': 'dataurl',
+        '.woff2': 'dataurl',
+      },
+      outfile: outBundle,
+    });
   } finally {
     if (tempBootstrapPath && fs.existsSync(tempBootstrapPath)) {
       fs.rmSync(tempBootstrapPath, { force: true });
@@ -739,17 +834,38 @@ export async function buildAndLaunchSite(siteId: string): Promise<void> {
     }
 
     if (detection.mode === 'node_build_static') {
-      if (!fs.existsSync(path.join(siteDir, 'node_modules'))) {
-        appendLog(siteId, 'تثبيت الحزم المطلوبة (npm install)...');
-        const installCode = await runShellCommand(
-          siteId,
-          'npm',
-          ['install', '--include=dev', '--no-audit', '--no-fund'],
-          siteDir,
-          { NODE_ENV: 'development' },
-        );
-        if (installCode !== 0) {
-          appendLog(siteId, 'تنبيه: تعذر إكمال npm install، سيتم محاولة التجميع المباشر...');
+      let usedSymlinks = false;
+      const hasExistingNm = fs.existsSync(path.join(siteDir, 'node_modules'));
+
+      if (!hasExistingNm) {
+        const missingPkgs = getMissingWorkspacePackages(siteDir);
+        if (missingPkgs.length === 0) {
+          usedSymlinks = linkWorkspaceNodeModules(siteDir);
+          if (usedSymlinks) {
+            appendLog(siteId, 'تجهيز الحزم من الكاش السريع للخادم...');
+          }
+        }
+        if (!usedSymlinks) {
+          appendLog(siteId, 'تثبيت الحزم المطلوبة (npm install)...');
+          const installCode = await runShellCommand(
+            siteId,
+            'npm',
+            [
+              'install',
+              '--include=dev',
+              '--no-audit',
+              '--no-fund',
+              '--prefer-offline',
+              '--legacy-peer-deps',
+              '--loglevel=error',
+            ],
+            siteDir,
+            { NODE_ENV: 'development' },
+          );
+          if (installCode !== 0) {
+            appendLog(siteId, 'تنبيه: تعذر إكمال npm install، سيتم محاولة التجميع المباشر...');
+            usedSymlinks = linkWorkspaceNodeModules(siteDir);
+          }
         }
       }
 
@@ -763,41 +879,57 @@ export async function buildAndLaunchSite(siteId: string): Promise<void> {
       const hasVite = Boolean(pkg.dependencies?.vite || pkg.devDependencies?.vite);
 
       let buildCode = 1;
-      if (hasVite && (!pkg.scripts?.build || pkg.scripts.build.includes('vite build'))) {
-        buildCode = await runShellCommand(
-          siteId,
-          'npx',
-          ['vite', 'build', '--base=./'],
-          siteDir,
-        );
-      } else {
-        buildCode = await runShellCommand(siteId, 'npm', ['run', 'build'], siteDir);
-        if (buildCode !== 0 && hasVite) {
-          appendLog(siteId, 'إعادة المحاولة عبر vite build مباشرة...');
-          buildCode = await runShellCommand(
-            siteId,
-            'npx',
-            ['vite', 'build', '--base=./'],
-            siteDir,
-          );
-        }
-      }
-
-      if (buildCode !== 0) {
-        const fallbackEntry = [
-          'src/main.tsx',
-          'src/main.jsx',
-          'src/index.tsx',
-          'src/index.jsx',
-          'src/App.tsx',
-          'src/App.jsx',
-        ].find((c) => fs.existsSync(path.join(siteDir, c)));
-
-        if (fallbackEntry) {
-          appendLog(siteId, `تفعيل التجميع الاحتياطي عبر ESBuild لملف ${fallbackEntry}...`);
-          await bundleReactWithLocalEsbuild(siteId, siteDir, fallbackEntry);
+      try {
+        if (hasVite && (!pkg.scripts?.build || pkg.scripts.build.includes('vite build'))) {
+          const localViteBin = path.join(siteDir, 'node_modules/.bin/vite');
+          if (fs.existsSync(localViteBin)) {
+            buildCode = await runShellCommand(
+              siteId,
+              localViteBin,
+              ['build', '--base=./'],
+              siteDir,
+            );
+          } else {
+            buildCode = await runShellCommand(
+              siteId,
+              'npx',
+              ['vite', 'build', '--base=./'],
+              siteDir,
+            );
+          }
         } else {
-          throw new Error('فشل بناء المشروع (npm run build)');
+          buildCode = await runShellCommand(siteId, 'npm', ['run', 'build'], siteDir);
+          if (buildCode !== 0 && hasVite) {
+            appendLog(siteId, 'إعادة المحاولة عبر vite build مباشرة...');
+            buildCode = await runShellCommand(
+              siteId,
+              'npx',
+              ['vite', 'build', '--base=./'],
+              siteDir,
+            );
+          }
+        }
+
+        if (buildCode !== 0) {
+          const fallbackEntry = [
+            'src/main.tsx',
+            'src/main.jsx',
+            'src/index.tsx',
+            'src/index.jsx',
+            'src/App.tsx',
+            'src/App.jsx',
+          ].find((c) => fs.existsSync(path.join(siteDir, c)));
+
+          if (fallbackEntry) {
+            appendLog(siteId, `تفعيل التجميع المباشر السريع لملف ${fallbackEntry}...`);
+            await bundleReactWithLocalEsbuild(siteId, siteDir, fallbackEntry);
+          } else {
+            throw new Error('فشل بناء المشروع (npm run build)');
+          }
+        }
+      } finally {
+        if (usedSymlinks) {
+          cleanupSymlinkedNodeModules(siteDir);
         }
       }
 
@@ -822,16 +954,32 @@ export async function buildAndLaunchSite(siteId: string): Promise<void> {
     if (detection.mode === 'node_server') {
       const hasPkg = fs.existsSync(path.join(siteDir, 'package.json'));
       if (hasPkg && !fs.existsSync(path.join(siteDir, 'node_modules'))) {
-        appendLog(siteId, 'تثبيت حزم Node.js (npm install)...');
-        const installCode = await runShellCommand(
-          siteId,
-          'npm',
-          ['install', '--include=dev', '--no-audit', '--no-fund'],
-          siteDir,
-          { NODE_ENV: 'development' },
-        );
-        if (installCode !== 0) {
-          throw new Error('فشل تثبيت حزم Node.js');
+        const missingPkgs = getMissingWorkspacePackages(siteDir);
+        let linked = false;
+        if (missingPkgs.length === 0) {
+          linked = linkWorkspaceNodeModules(siteDir);
+          if (linked) appendLog(siteId, 'ربط حزم Node.js من الكاش السريع للخادم...');
+        }
+        if (!linked) {
+          appendLog(siteId, 'تثبيت حزم Node.js (npm install)...');
+          const installCode = await runShellCommand(
+            siteId,
+            'npm',
+            [
+              'install',
+              '--include=dev',
+              '--no-audit',
+              '--no-fund',
+              '--prefer-offline',
+              '--legacy-peer-deps',
+              '--loglevel=error',
+            ],
+            siteDir,
+            { NODE_ENV: 'development' },
+          );
+          if (installCode !== 0) {
+            throw new Error('فشل تثبيت حزم Node.js');
+          }
         }
       }
 

@@ -17,6 +17,18 @@ const SKIP_SEGMENTS = new Set([
   'venv',
   'target',
   '.gradle',
+  '.cache',
+  '.turbo',
+  '.parcel-cache',
+  '.vite',
+  '.nuxt',
+  '.svelte-kit',
+  '.idea',
+  '.vscode',
+  'coverage',
+  '.npm',
+  '.yarn',
+  '.pnpm-store',
 ]);
 
 function shouldSkipPath(relPath: string): boolean {
@@ -51,12 +63,12 @@ async function readEntryRecursively(
         reader.readEntries(resolve, reject);
       });
 
+    const nextPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
     let batch = await readBatch();
     while (batch.length > 0) {
-      const nextPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
-      for (const child of batch) {
-        await readEntryRecursively(child, nextPrefix, out);
-      }
+      await Promise.all(
+        batch.map((child) => readEntryRecursively(child, nextPrefix, out)),
+      );
       batch = await readBatch();
     }
   }

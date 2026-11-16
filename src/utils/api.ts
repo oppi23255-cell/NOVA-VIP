@@ -50,8 +50,32 @@ export interface InlineUploadPayload {
   files?: Array<{ relPath: string; dataBase64: string }>;
 }
 
-const CHUNK_BYTE_LIMIT = 1024 * 1024; // 1 MB raw -> ~1.33 MB JSON base64
+const CHUNK_BYTE_LIMIT = Math.floor(2.5 * 1024 * 1024); // 2.5 MB raw -> ~3.3 MB JSON base64
 const INLINE_RAW_LIMIT = Math.floor(2.8 * 1024 * 1024); // ~3.7 MB JSON base64 (fits Vercel 4.5 MB limit)
+const UPLOAD_CONCURRENCY = 3;
+
+async function encodeFilesParallel(
+  items: Array<{ file: File; relPath: string }>,
+): Promise<Array<{ relPath: string; dataBase64: string; size: number }>> {
+  const results: Array<{ relPath: string; dataBase64: string; size: number }> = [];
+  const validItems = items.filter((item) => item.file.size <= 8 * 1024 * 1024);
+  const CONCURRENCY = 8;
+  for (let i = 0; i < validItems.length; i += CONCURRENCY) {
+    const slice = validItems.slice(i, i + CONCURRENCY);
+    const encoded = await Promise.all(
+      slice.map(async (item) => {
+        const buf = await item.file.arrayBuffer();
+        return {
+          relPath: item.relPath,
+          dataBase64: arrayBufferToBase64(buf),
+          size: item.file.size,
+        };
+      }),
+    );
+    results.push(...encoded);
+  }
+  return results;
+}
 
 export async function uploadAndInspectChunked(
   upload: CollectedUpload,
@@ -78,20 +102,16 @@ export async function uploadAndInspectChunked(
         dataBase64: arrayBufferToBase64(buf),
       };
     } else if (upload.files && upload.files.length > 0) {
-      const encoded: Array<{ relPath: string; dataBase64: string }> = [];
-      for (const item of upload.files) {
-        const buf = await item.file.arrayBuffer();
-        encoded.push({
-          relPath: item.relPath,
-          dataBase64: arrayBufferToBase64(buf),
-        });
-      }
-      inlinePayload = { kind: 'folder', files: encoded };
+      const encoded = await encodeFilesParallel(upload.files);
+      inlinePayload = {
+        kind: 'folder',
+        files: encoded.map(({ relPath, dataBase64 }) => ({ relPath, dataBase64 })),
+      };
     } else {
       throw new Error('لم يتم اختيار أي ملفات صالحة للرفع');
     }
 
-    onProgress?.(60);
+    onProgress?.(65);
     const inspected = await safeFetchJson<{ detection: ProjectDetection }>(
       '/api/inspect-inline',
       {
@@ -137,55 +157,61 @@ export async function uploadAndInspectChunked(
       );
 
       offset = end;
-      onProgress?.(Math.min(95, Math.round((offset / total) * 95)));
+      onProgress?.(Math.min(92, Math.round((offset / total) * 92)));
     }
   } else if (upload.files && upload.files.length > 0) {
+    onProgress?.(10);
+    const encodedFiles = await encodeFilesParallel(upload.files);
     const totalBytes = Math.max(
-      upload.files.reduce((acc, f) => acc + f.file.size, 0),
+      encodedFiles.reduce((acc, f) => acc + f.size, 0),
       1,
     );
-    let sentBytes = 0;
-    let batch: Array<{ relPath: string; dataBase64: string }> = [];
-    let batchBytes = 0;
 
-    for (const item of upload.files) {
-      // Skip individual files > 8 MB to avoid single-chunk proxy rejection
-      if (item.file.size > 8 * 1024 * 1024) {
-        sentBytes += item.file.size;
-        continue;
+    const batches: Array<{
+      files: Array<{ relPath: string; dataBase64: string }>;
+      bytes: number;
+    }> = [];
+    let currentFiles: Array<{ relPath: string; dataBase64: string }> = [];
+    let currentBytes = 0;
+
+    for (const item of encodedFiles) {
+      if (currentFiles.length > 0 && currentBytes + item.size > CHUNK_BYTE_LIMIT) {
+        batches.push({ files: currentFiles, bytes: currentBytes });
+        currentFiles = [];
+        currentBytes = 0;
       }
-      const buf = await item.file.arrayBuffer();
-      const b64 = arrayBufferToBase64(buf);
+      currentFiles.push({ relPath: item.relPath, dataBase64: item.dataBase64 });
+      currentBytes += item.size;
+    }
+    if (currentFiles.length > 0) {
+      batches.push({ files: currentFiles, bytes: currentBytes });
+    }
 
-      if (batch.length > 0 && batchBytes + item.file.size > CHUNK_BYTE_LIMIT) {
+    let sentBytes = 0;
+    let cursor = 0;
+
+    const runWorker = async () => {
+      while (cursor < batches.length) {
+        const idx = cursor++;
+        const batch = batches[idx];
         await safeFetchJson<{ ok: boolean }>(
           `/api/uploads/${encodeURIComponent(uploadId)}/chunk`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ files: batch }),
+            body: JSON.stringify({ files: batch.files }),
           },
         );
-        batch = [];
-        batchBytes = 0;
+        sentBytes += batch.bytes;
+        onProgress?.(Math.min(92, Math.round((sentBytes / totalBytes) * 92)));
       }
+    };
 
-      batch.push({ relPath: item.relPath, dataBase64: b64 });
-      batchBytes += item.file.size;
-      sentBytes += item.file.size;
-      onProgress?.(Math.min(95, Math.round((sentBytes / totalBytes) * 95)));
-    }
-
-    if (batch.length > 0) {
-      await safeFetchJson<{ ok: boolean }>(
-        `/api/uploads/${encodeURIComponent(uploadId)}/chunk`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ files: batch }),
-        },
-      );
-    }
+    const workers = Array.from(
+      { length: Math.min(UPLOAD_CONCURRENCY, Math.max(batches.length, 1)) },
+      () => runWorker(),
+    );
+    await Promise.all(workers);
   } else {
     throw new Error('لم يتم اختيار أي ملفات صالحة للرفع');
   }
