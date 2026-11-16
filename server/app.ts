@@ -711,8 +711,13 @@ export async function createHostingApp(
     } catch {
       // ignore
     }
+    const tld = domain.split('.').pop() || '';
+    const hasInvalidTld = !domain.includes('.') || !/^[a-z]{2,24}$/i.test(tld);
+
     if (dnsA.length === 0 && dnsCname.length === 0) {
-      dnsError = 'لم يتم العثور على سجلات DNS عامة لهذا النطاق بعد';
+      dnsError = hasInvalidTld
+        ? `النطاق "${domain}" لا يحتوي على امتداد إنترنت حقيقي صالح (مثل .com أو .icu)؛ لذلك يرفض المتصفح فتحه ويعرض DNS_PROBE_FINISHED_NXDOMAIN.`
+        : 'لم يتم العثور على سجلات DNS عامة لهذا النطاق على الإنترنت بعد';
     }
 
     const localRouteStatus = IS_SERVERLESS

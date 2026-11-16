@@ -51,8 +51,9 @@ export function SitesListView({
 
   async function handleCopy(e: React.MouseEvent, site: SiteRecord) {
     e.stopPropagation();
-    const url = buildCustomDomainUrl(site.customDomain);
-    await navigator.clipboard.writeText(url);
+    const previewPath = buildInternalPreviewPath(site.customDomain);
+    const shareUrl = `${window.location.origin}${previewPath}`;
+    await navigator.clipboard.writeText(shareUrl);
     setCopiedId(site.id);
     setTimeout(() => setCopiedId(null), 1800);
   }

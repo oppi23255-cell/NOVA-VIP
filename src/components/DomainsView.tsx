@@ -106,7 +106,8 @@ export function DomainsView({
                       <button
                         type="button"
                         onClick={async () => {
-                          await navigator.clipboard.writeText(customUrl);
+                          const shareUrl = `${window.location.origin}${buildInternalPreviewPath(site.customDomain)}`;
+                          await navigator.clipboard.writeText(shareUrl);
                           setCopiedId(site.id);
                           setTimeout(() => setCopiedId(null), 1500);
                         }}
@@ -120,7 +121,7 @@ export function DomainsView({
                         ) : (
                           <>
                             <Copy className="w-3.5 h-3.5" />
-                            <span>نسخ الدومين</span>
+                            <span>نسخ رابط التشغيل</span>
                           </>
                         )}
                       </button>

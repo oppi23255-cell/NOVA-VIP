@@ -80,6 +80,14 @@ export function SiteDetailView({
 
   const liveUrl = buildCustomDomainUrl(site.customDomain);
   const previewPath = buildInternalPreviewPath(site.customDomain);
+  const workingRunUrl =
+    typeof window !== 'undefined'
+      ? `${window.location.origin}${previewPath}`
+      : previewPath;
+  const isDnsConfigured = Boolean(
+    verifyResult &&
+      (verifyResult.dnsA.length > 0 || verifyResult.dnsCname.length > 0),
+  );
 
   useEffect(() => {
     setDomainInput(site.customDomain);
@@ -176,7 +184,7 @@ export function SiteDetailView({
   }
 
   async function handleCopyUrl() {
-    await navigator.clipboard.writeText(liveUrl);
+    await navigator.clipboard.writeText(isDnsConfigured ? liveUrl : workingRunUrl);
     setCopied(true);
     setTimeout(() => setCopied(false), 1800);
   }
@@ -317,12 +325,16 @@ export function SiteDetailView({
               {copied ? (
                 <>
                   <Check className="w-3.5 h-3.5 text-emerald-700" />
-                  <span>تم نسخ الرابط</span>
+                  <span>تم نسخ رابط التشغيل</span>
                 </>
               ) : (
                 <>
                   <Copy className="w-3.5 h-3.5" />
-                  <span>نسخ الرابط المباشر</span>
+                  <span>
+                    {isDnsConfigured
+                      ? 'نسخ رابط الدومين'
+                      : 'نسخ رابط التشغيل الفوري'}
+                  </span>
                 </>
               )}
             </button>
@@ -334,18 +346,29 @@ export function SiteDetailView({
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 whitespace-nowrap shrink-0"
             >
               <ExternalLink className="w-3.5 h-3.5" />
-              <span>فتح المشروع (معاينة كاملة)</span>
+              <span>فتح المشروع الآن</span>
             </a>
 
-            <a
-              href={liveUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
-            >
-              <Globe className="w-3.5 h-3.5" />
-              <span>فتح الدومين</span>
-            </a>
+            {isDnsConfigured ? (
+              <a
+                href={liveUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
+              >
+                <Globe className="w-3.5 h-3.5 text-emerald-700" />
+                <span>فتح الدومين</span>
+              </a>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setTab('dns')}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded-lg hover:bg-amber-100 whitespace-nowrap shrink-0"
+              >
+                <Globe className="w-3.5 h-3.5" />
+                <span>ربط الدومين (DNS)</span>
+              </button>
+            )}
 
             <a
               href={`/api/sites/${site.id}/download`}
@@ -410,47 +433,43 @@ export function SiteDetailView({
         </div>
 
         <div className="bg-white border border-slate-200 rounded-lg px-4 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
-          <div className="flex items-center gap-2 min-w-0">
-            <span className="text-slate-500 shrink-0">الدومين المخصص:</span>
+          <div className="flex flex-wrap items-center gap-2 min-w-0">
+            <span className="text-slate-500 shrink-0">رابط التشغيل الفوري:</span>
             <a
-              href={liveUrl}
+              href={previewPath}
               target="_blank"
               rel="noopener noreferrer"
               dir="ltr"
               className="font-mono text-teal-800 hover:underline truncate"
             >
-              {liveUrl}
+              {workingRunUrl}
             </a>
           </div>
           <span className="text-slate-500 shrink-0">{site.statusMessage}</span>
         </div>
 
-        {verifyResult &&
-          verifyResult.dnsA.length === 0 &&
-          verifyResult.dnsCname.length === 0 && (
-            <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 text-xs text-amber-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="leading-relaxed">
-                <span className="font-semibold">
-                  ملاحظة DNS ({site.customDomain}):
-                </span>{' '}
-                لم يتم العثور على سجل DNS عام لهذا النطاق على الإنترنت بعد (لذلك
-                يظهر{' '}
-                <span className="font-mono" dir="ltr">
-                  DNS_PROBE_FINISHED_NXDOMAIN
-                </span>{' '}
-                عند فتح الرابط العام حتى تسجل الدومين وتربط سجلات الـ DNS). يمكنك
-                تشغيل ومشاهدة المشروع الآن عبر زر{' '}
-                <span className="font-semibold">فتح المشروع (معاينة كاملة)</span>.
-              </div>
-              <button
-                type="button"
-                onClick={() => setTab('dns')}
-                className="px-3 py-1.5 text-xs font-semibold text-amber-950 bg-white border border-amber-300 rounded-md hover:bg-amber-100 whitespace-nowrap shrink-0 self-start sm:self-center"
-              >
-                خطوات ربط الـ DNS
-              </button>
+        {verifyResult && !isDnsConfigured && (
+          <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 text-xs text-amber-950 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="leading-relaxed">
+              <span className="font-semibold">
+                لماذا لا يفتح {site.customDomain} مباشرة في المتصفح؟
+              </span>{' '}
+              {verifyResult.dnsError ||
+                'لم يتم ضبط سجلات DNS العامة لهذا الدومين بعد.'}{' '}
+              استخدم زر <span className="font-semibold">فتح المشروع الآن</span>{' '}
+              أو <span className="font-semibold">نسخ رابط التشغيل الفوري</span>{' '}
+              أعلاه ليفتح المشروع معك ومع أي مستخدم فوراً، أو اربط دوميناً حقيقياً
+              مسجلاً عبر <span className="font-semibold">خطوات ربط الـ DNS</span>.
             </div>
-          )}
+            <button
+              type="button"
+              onClick={() => setTab('dns')}
+              className="px-3 py-1.5 text-xs font-semibold text-amber-950 bg-white border border-amber-300 rounded-md hover:bg-amber-100 whitespace-nowrap shrink-0 self-start sm:self-center"
+            >
+              إعداد الدومين الحقيقي
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Sub-navigation Tabs */}

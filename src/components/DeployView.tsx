@@ -668,6 +668,15 @@ export function DeployView({ health, templates, onDeployed }: DeployViewProps) {
                       : health?.serverIp || 'YOUR_SERVER_IP'}
                   </span>
                 </div>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  ملاحظة: يفتح{' '}
+                  <span className="font-mono" dir="ltr">
+                    https://{normalizedDomain}
+                  </span>{' '}
+                  عند كل المستخدمين فقط إذا كان النطاق مسجلاً ومربوطاً بالـ DNS.
+                  وحتى قبل ربط الـ DNS يمكنك تشغيل المشروع وفتحه فوراً من لوحة
+                  المعاينة.
+                </p>
               </div>
             )}
           </div>
